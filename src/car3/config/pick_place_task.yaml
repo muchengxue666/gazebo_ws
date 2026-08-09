@@ -1,0 +1,60 @@
+output_frame: map
+camera_info_topic: /camera/rgb/camera_info
+processing_rate: 5.0
+min_depth: 0.03
+max_depth: 1.0
+min_face_pixels: 14
+max_face_pixels: 320
+min_quad_area: 260.0
+min_face_size: 0.025
+max_face_size: 0.12
+template_score_threshold: 0.38
+template_score_margin: 0.04
+surface_to_center_depth: 0.02
+stability_samples: 5
+required_votes: 3
+max_position_std: 0.025
+publish_debug_image: true
+depth_debug_max: 4.0
+rgb_pose_fallback: true
+rgb_cube_size: 0.04
+rgb_pose_min_depth: 0.05
+rgb_pose_max_depth: 0.8
+
+# These are search priors copied from the immutable spawn script.
+search_areas:
+  area_a: {x_min: -2.10, x_max: -1.92, y_min: -0.61, y_max: -0.28}
+  area_b: {x_min: -1.56, x_max: -1.23, y_min: -0.01, y_max: 0.17}
+  area_c: {x_min: -0.95, x_max: -0.77, y_min: -0.69, y_max: -0.36}
+
+drop_areas:
+  electronics: {x_min: 2.30, x_max: 2.80, y_min: -2.47, y_max: -1.97}
+  food: {x_min: 0.75, x_max: 1.25, y_min: -3.23, y_max: -2.73}
+
+# Navigation observation poses and arm trajectories must be measured in Gazebo.
+# The task executor must reject startup while calibrated remains false.
+calibration:
+  calibrated: false
+  observation_poses: {}
+  arm_poses:
+    observe:
+      positions: [0.001026, 1.005277, 0.753804, 1.381747, 0.188403]
+      duration: 3.0
+    grasp:
+      positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.004899]
+      duration: 3.0
+  gripper_open: 1.5
+  gripper_close: 0.8
+  grasp_alignment:
+    base_map_reference:
+      x: -1.068817
+      y: -0.349280
+      yaw: -0.020994
+    desired_cube_in_base:
+      x: 0.000305
+      y: -0.001024
+      z: 0.005995
+    ready_offset_before_close:
+      x: 0.010401
+      y: -0.005301
+      z: 0.004844

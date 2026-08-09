@@ -1,0 +1,7 @@
+header:
+  stamp: {secs: 0, nsecs: 0}
+  frame_id: ''
+joint_names: [arm_joint1, arm_joint2, arm_joint3, arm_joint4, arm_joint5]
+points:
+  - positions: [0.0, 1.6, -2.2, -1.0, 0.0]
+    time_from_start: {secs: 3, nsecs: 0}

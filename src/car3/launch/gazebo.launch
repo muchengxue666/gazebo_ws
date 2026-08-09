@@ -1,0 +1,41 @@
+<launch>
+    <arg name="gui" default="true"/>
+    <arg name="debug" default="false"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find car3)/world/math.world"/> 
+    <arg name="debug" value="$(arg debug)" />
+    <arg name="gui" value="$(arg gui)" />
+  </include>
+
+  <param name="robot_description" textfile="$(find car3)/urdf/car3.urdf" />
+
+  <env name="GAZEBO_MODEL_PATH" value="$(find car3)/models:$(optenv GAZEBO_MODEL_PATH)" />
+
+  <node name="spawn_model" pkg="gazebo_ros" type="spawn_model"
+        args="-param robot_description -urdf -model car3 -x 0 -y 0 -z 0.01" output="screen" />
+
+  <node name="spawn_cubes" pkg="car3" type="spawn_cubes.py" output="screen" />
+
+  <include file="$(find gazebo_nav)/launch/gazebo_nav.launch" /> 
+
+  <rosparam file="$(find car3)/config/car3_control.yaml" command="load"/>
+
+  <node name="controller_spawner" pkg="controller_manager" type="spawner"
+      args="joint_state_controller arm_controller gripper_controller"
+      output="screen" />
+
+  <node name="gripper_mimic" pkg="car3" type="gripper_mimic.py" output="screen" />
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher">
+    <remap from="joint_states" to="joint_states_full" />
+    <param name="publish_frequency" value="50.0" />
+  </node>
+
+  <node name="grasp_attach" pkg="car3" type="grasp_attach.py" output="screen">
+    <rosparam param="object_models">['cube_0', 'cube_1', 'cube_2']</rosparam>
+  </node>
+
+  <node name="fake_joint_calibration" pkg="rostopic" type="rostopic"
+        args="pub /calibrated std_msgs/Bool true" />
+</launch>

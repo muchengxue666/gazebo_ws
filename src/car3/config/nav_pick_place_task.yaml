@@ -1,0 +1,83 @@
+# Independent first-stage task configuration.
+# Navigation remains the validated static_nav_sim chain.
+target_category: food
+start_task: false
+arm_poses_verified: false
+
+category_to_model:
+  food: cube_0
+  daily: cube_1
+  electronics: cube_2
+
+# These are search-area priors from spawn_cubes.py, not fixed cube poses.
+search_areas:
+  area_a: {x_min: -2.10, x_max: -1.92, y_min: -0.61, y_max: -0.28}
+  area_b: {x_min: -1.56, x_max: -1.23, y_min: -0.01, y_max: 0.17}
+  area_c: {x_min: -0.95, x_max: -0.77, y_min: -0.69, y_max: -0.36}
+
+drop_areas:
+  food: {x_min: 0.75, x_max: 1.25, y_min: -3.23, y_max: -2.73}
+  electronics: {x_min: 2.30, x_max: 2.80, y_min: -2.47, y_max: -1.97}
+  # daily is intentionally omitted until its map coordinates are verified.
+
+map_bounds:
+  x_min: -2.4696
+  x_max: 3.096
+  y_min: -3.5001
+  y_max: 0.517
+
+# Existing values are starting poses only. Set arm_poses_verified true only
+# after checking these poses and the derived tcp_link geometry in Gazebo.
+# The base must be stationary while observe/grasp/place poses are active.
+arm_poses:
+  # Must stay clear of the horizontal laser scan plane during navigation.
+  navigation:
+    positions: [0.0, 1.6, -2.2, -1.0, 0.0]
+    duration: 3.0
+  observe:
+    positions: [0.001026, 1.005277, 0.753804, 1.381747, 0.188403]
+    duration: 3.0
+  grasp:
+    positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.004899]
+    duration: 3.0
+  # Keep the object attached in this raised posture while navigating.
+  transport:
+    positions: [0.0, 1.6, -2.2, -1.0, 0.0]
+    duration: 3.0
+  place:
+    positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.004899]
+    duration: 3.0
+
+gripper_open: 1.5
+gripper_close: 0.8
+min_confidence: 0.38
+max_pose_age: 0.8
+detection_timeout: 12.0
+arm_timeout: 8.0
+nav_timeout: 45.0
+server_wait_timeout: 60.0
+navigation_ready_timeout: 60.0
+navigation_startup_delay: 10.0
+navigation_stable_time: 3.0
+navigation_pose_tolerance: 0.03
+navigation_data_timeout: 2.5
+navigation_min_costmap_updates: 3
+attach_timeout: 5.0
+release_timeout: 5.0
+nav_retries: 1
+max_align_iterations: 6
+max_align_step: 0.15
+align_xy_tolerance: 0.012
+align_z_tolerance: 0.03
+search_standoff: 0.35
+search_angles: [0.0, 1.5708, -1.5708, 3.14159]
+# Small in-place heading adjustments at the same observation point.
+search_heading_offsets: [0.35, -0.35]
+drop_margin: 0.05
+drop_settle_samples: 5
+drop_settle_delta: 0.01
+joint_tolerance: 0.03
+goal_time_tolerance: 1.5
+settle_position_delta: 0.002
+settle_timeout: 2.0
+settle_samples: 5

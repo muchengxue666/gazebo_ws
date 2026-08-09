@@ -1,0 +1,59 @@
+<launch>
+  <arg name="gui" default="true"/>
+  <arg name="debug" default="false"/>
+  <arg name="rviz" default="true"/>
+  <arg name="teleop" default="false"/>
+  <arg name="spawn_dynamic_objects" default="true"/>
+  <arg name="use_teb" default="true"/>
+  <arg name="use_amcl" default="true"/>
+  <arg name="teb_homotopy" default="false"/>
+  <arg name="spawn_x" default="0.0"/>
+  <arg name="spawn_y" default="0.0"/>
+  <arg name="spawn_yaw" default="0.0"/>
+  <arg name="map_file" default="$(find gazebo_map)/map/ros_map_thin/ros_map_world_collision.yaml"/>
+
+  <include file="$(find gazebo_map)/launch/slam_sim.launch">
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="debug" value="$(arg debug)"/>
+    <arg name="rviz" value="false"/>
+    <arg name="teleop" value="$(arg teleop)"/>
+    <arg name="spawn_dynamic_objects" value="$(arg spawn_dynamic_objects)"/>
+    <arg name="enable_slam" value="false"/>
+    <arg name="spawn_x" value="$(arg spawn_x)"/>
+    <arg name="spawn_y" value="$(arg spawn_y)"/>
+    <arg name="spawn_yaw" value="$(arg spawn_yaw)"/>
+  </include>
+
+  <node name="map_server" pkg="map_server" type="map_server"
+        args="$(arg map_file)" output="screen"/>
+
+  <node if="$(arg use_amcl)" name="amcl" pkg="amcl" type="amcl"
+        output="screen" clear_params="true">
+    <rosparam file="$(find gazebo_nav)/launch/config/static_nav/amcl.yaml"
+              command="load"/>
+    <param name="initial_pose_x" value="$(arg spawn_x)"/>
+    <param name="initial_pose_y" value="$(arg spawn_y)"/>
+    <param name="initial_pose_a" value="$(arg spawn_yaw)"/>
+    <remap from="scan" to="/scan"/>
+  </node>
+
+  <node unless="$(arg use_amcl)" name="map_to_odom" pkg="tf2_ros"
+        type="static_transform_publisher"
+        args="0 0 0 0 0 0 map odom"/>
+
+  <node name="move_base" pkg="move_base" type="move_base"
+        output="screen" clear_params="true">
+    <rosparam file="$(find gazebo_nav)/launch/config/static_nav/move_base.yaml"
+              command="load"/>
+    <rosparam if="$(arg use_teb)"
+              file="$(find gazebo_nav)/launch/config/static_nav/teb_local_planner_params.yaml"
+              command="load"/>
+    <param if="$(arg use_teb)" name="base_local_planner"
+           value="teb_local_planner/TebLocalPlannerROS"/>
+    <param if="$(arg use_teb)" name="TebLocalPlannerROS/enable_homotopy_class_planning"
+           value="$(arg teb_homotopy)"/>
+  </node>
+
+  <node if="$(arg rviz)" name="navigation_rviz" pkg="rviz" type="rviz"
+        args="-d $(find gazebo_nav)/rviz/static_nav.rviz" required="false"/>
+</launch>

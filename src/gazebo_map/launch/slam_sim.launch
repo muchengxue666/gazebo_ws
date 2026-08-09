@@ -1,0 +1,96 @@
+<launch>
+  <arg name="gui" default="true"/>
+  <arg name="debug" default="false"/>
+  <arg name="rviz" default="true"/>
+  <arg name="teleop" default="true"/>
+  <arg name="spawn_dynamic_objects" default="true"/>
+  <arg name="enable_slam" default="false"/>
+  <arg name="spawn_x" default="0.0"/>
+  <arg name="spawn_y" default="0.0"/>
+  <arg name="spawn_yaw" default="0.0"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find car3)/world/math.world"/>
+    <arg name="debug" value="$(arg debug)"/>
+    <arg name="gui" value="$(arg gui)"/>
+  </include>
+
+  <param name="robot_description" textfile="$(find car3)/urdf/car3.urdf"/>
+
+  <env name="GAZEBO_MODEL_PATH" value="$(find car3)/models:$(optenv GAZEBO_MODEL_PATH)"/>
+
+  <node name="spawn_model" pkg="gazebo_ros" type="spawn_model"
+        args="-param robot_description -urdf -model car3 -x $(arg spawn_x) -y $(arg spawn_y) -z 0.01 -Y $(arg spawn_yaw)"
+        output="screen"/>
+
+  <node if="$(arg spawn_dynamic_objects)" name="spawn_cubes"
+        pkg="car3" type="spawn_cubes.py" output="screen"/>
+
+  <rosparam file="$(find car3)/config/car3_control.yaml" command="load"/>
+
+  <node name="controller_spawner" pkg="controller_manager" type="spawner"
+        args="joint_state_controller arm_controller gripper_controller"
+        output="screen"/>
+
+  <node name="gripper_mimic" pkg="car3" type="gripper_mimic.py" output="screen"/>
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher"
+        type="robot_state_publisher">
+    <remap from="joint_states" to="joint_states_full"/>
+    <param name="publish_frequency" value="50.0"/>
+  </node>
+
+  <node name="grasp_attach" pkg="car3" type="grasp_attach.py" output="screen">
+    <rosparam param="object_models">['cube_0', 'cube_1', 'cube_2']</rosparam>
+  </node>
+
+  <node name="fake_joint_calibration" pkg="rostopic" type="rostopic"
+        args="pub /calibrated std_msgs/Bool true"/>
+
+  <node if="$(arg enable_slam)" pkg="gmapping" type="slam_gmapping"
+        name="slam_gmapping" output="screen" clear_params="true">
+    <param name="map_frame" value="map"/>
+    <param name="odom_frame" value="odom"/>
+    <param name="base_frame" value="base_footprint"/>
+    <param name="map_update_interval" value="0.5"/>
+    <param name="maxRange" value="5.0"/>
+    <param name="maxUrange" value="4.5"/>
+    <param name="sigma" value="0.05"/>
+    <param name="kernelSize" value="1"/>
+    <param name="lstep" value="0.05"/>
+    <param name="astep" value="0.05"/>
+    <param name="iterations" value="5"/>
+    <param name="lsigma" value="0.075"/>
+    <param name="ogain" value="3.0"/>
+    <param name="lskip" value="0"/>
+    <param name="minimumScore" value="50.0"/>
+    <param name="srr" value="0.01"/>
+    <param name="srt" value="0.02"/>
+    <param name="str" value="0.01"/>
+    <param name="stt" value="0.02"/>
+    <param name="linearUpdate" value="0.10"/>
+    <param name="angularUpdate" value="0.087"/>
+    <param name="temporalUpdate" value="0.5"/>
+    <param name="resampleThreshold" value="0.5"/>
+    <param name="particles" value="80"/>
+    <param name="xmin" value="-1.0"/>
+    <param name="ymin" value="-1.0"/>
+    <param name="xmax" value="1.0"/>
+    <param name="ymax" value="1.0"/>
+    <param name="delta" value="0.05"/>
+    <param name="llsamplerange" value="0.01"/>
+    <param name="llsamplestep" value="0.01"/>
+    <param name="lasamplerange" value="0.005"/>
+    <param name="lasamplestep" value="0.005"/>
+    <remap from="scan" to="/scan"/>
+  </node>
+
+  <node if="$(arg rviz)" name="slam_rviz" pkg="rviz" type="rviz"
+        args="-f map" required="false"/>
+
+  <node if="$(arg teleop)" name="robot_steering"
+        pkg="rqt_robot_steering" type="rqt_robot_steering"
+        required="false" output="screen">
+    <param name="default_topic" value="/cmd_vel"/>
+  </node>
+</launch>

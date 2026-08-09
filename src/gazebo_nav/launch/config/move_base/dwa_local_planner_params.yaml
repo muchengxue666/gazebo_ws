@@ -1,0 +1,56 @@
+DWAPlannerROS:
+  # 机器人物理参数
+  acc_lim_x: 1.0           # x方向加速度
+  acc_lim_y: 1.0           # y方向加速度，麦伦轮需要非零
+  acc_lim_th: 4.0          # 角加速度
+
+  max_vel_x: 0.8           # x最大速度
+  min_vel_x: -0.8          # x最小速度，允许倒退
+  max_vel_y: 0.6           # y最大速度，根据实际机器人调整
+  min_vel_y: -0.6          # y最小速度，允许倒退
+
+  max_vel_trans: 1       # 平移速度上限（可根据机器人能力调整）
+  min_vel_trans: 0.05
+
+  max_vel_theta: 3.0       # 最大角速度
+  min_vel_theta: -3.0      # 最小角速度
+
+  trans_stopped_vel: 0.1
+  theta_stopped_vel: 0.1
+
+  # 目标容忍度
+  yaw_goal_tolerance: 0.1
+  xy_goal_tolerance: 0.1
+  latch_xy_goal_tolerance: true
+
+  # 前向模拟参数
+  sim_time: 1.5
+  sim_granularity: 0.03
+  vx_samples: 20           # x方向采样点数
+  vy_samples: 10           # y方向采样点数，麦伦轮必需
+  vth_samples: 20          # 角速度采样点数
+  controller_frequency: 10.0
+
+  # 轨迹评分参数
+  path_distance_bias: 30.0
+  goal_distance_bias: 20.0
+  occdist_scale: 0.01
+  forward_point_distance: 0.3
+  stop_time_buffer: 0.1
+  scaling_speed: 0.8
+  max_scaling_factor: 0.2
+  publish_cost_grid: false
+
+  # 振荡预防参数
+  oscillation_reset_dist: 0.05
+
+  # 规划处理
+  prune_plan: true
+  global_frame_id: map
+
+  publish_traj_pc: false
+  publish_cost_grid_pc: false
+
+  hdiff_scale: 1.0
+  heading_points: 1
+

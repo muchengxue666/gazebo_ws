@@ -1,0 +1,37 @@
+<launch>
+  <arg name="gui" default="true"/>
+  <arg name="rviz" default="true"/>
+  <arg name="use_teb" default="true"/>
+  <arg name="teb_homotopy" default="false"/>
+  <arg name="spawn_dynamic_objects" default="true"/>
+  <arg name="target_category" default="food"/>
+  <arg name="start_task" default="false"/>
+  <arg name="run_observe_grasp" default="false"/>
+
+  <include file="$(find gazebo_nav)/launch/static_nav_sim.launch">
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="rviz" value="$(arg rviz)"/>
+    <arg name="use_teb" value="$(arg use_teb)"/>
+    <arg name="teb_homotopy" value="$(arg teb_homotopy)"/>
+    <arg name="spawn_dynamic_objects" value="$(arg spawn_dynamic_objects)"/>
+  </include>
+
+  <rosparam file="$(find car3)/config/pick_place_task.yaml"
+            command="load" ns="/pick_place"/>
+
+  <node name="cube_vision" pkg="car3" type="cube_vision.py" output="screen">
+    <rosparam file="$(find car3)/config/pick_place_task.yaml"
+              command="load"/>
+    <param name="template_dir"
+           value="$(find car3)/models/cube/meshes"/>
+  </node>
+
+  <param name="/pick_place/target_category" value="$(arg target_category)"/>
+  <param name="/pick_place/start_task" value="$(arg start_task)"/>
+
+  <node if="$(arg run_observe_grasp)"
+        name="test_observe_grasp" pkg="car3"
+        type="test_observe_grasp.py" output="screen">
+    <param name="target_category" value="$(arg target_category)"/>
+  </node>
+</launch>

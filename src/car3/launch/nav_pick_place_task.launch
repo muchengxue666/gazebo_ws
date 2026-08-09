@@ -1,0 +1,41 @@
+<launch>
+  <arg name="gui" default="true"/>
+  <arg name="rviz" default="true"/>
+  <arg name="spawn_dynamic_objects" default="true"/>
+  <arg name="start_task" default="false"/>
+  <arg name="arm_poses_verified" default="false"/>
+  <arg name="target_category" default="food"/>
+
+  <!-- Canonical validated navigation entry; do not replace with gazebo_nav.launch. -->
+  <!-- The immutable attach backend uses a strict '<' close check. A threshold
+       just above the valid 0.8 command makes r_joint=0.8 trigger grasp. -->
+  <param name="/grasp_attach/gripper_close_threshold" value="0.81"/>
+
+  <include file="$(find gazebo_nav)/launch/static_nav_sim.launch">
+    <arg name="gui" value="$(arg gui)"/>
+    <arg name="rviz" value="$(arg rviz)"/>
+    <arg name="teleop" value="false"/>
+    <arg name="spawn_dynamic_objects" value="$(arg spawn_dynamic_objects)"/>
+    <arg name="use_teb" value="true"/>
+    <arg name="teb_homotopy" value="false"/>
+    <arg name="map_file"
+         value="$(find gazebo_map)/map/ros_map_thin/ros_map_world_collision.yaml"/>
+  </include>
+
+  <!-- Keep the existing vision test configuration and node unchanged. -->
+  <node name="cube_vision" pkg="car3" type="cube_vision.py" output="screen">
+    <rosparam file="$(find car3)/config/pick_place_task.yaml"
+              command="load"/>
+    <!-- Vision parameters remain in the existing test config. -->
+    <param name="template_dir" value="$(find car3)/models/cube/meshes"/>
+  </node>
+
+  <node name="pick_place_executor" pkg="car3"
+        type="pick_place_executor.py" output="screen">
+    <rosparam file="$(find car3)/config/nav_pick_place_task.yaml"
+              command="load"/>
+    <param name="target_category" value="$(arg target_category)"/>
+    <param name="start_task" value="$(arg start_task)"/>
+    <param name="arm_poses_verified" value="$(arg arm_poses_verified)"/>
+  </node>
+</launch>

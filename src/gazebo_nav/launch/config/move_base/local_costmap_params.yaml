@@ -1,0 +1,21 @@
+local_costmap:
+  global_frame: map
+  robot_base_frame: base_link
+
+  update_frequency: 6.0          # 适度提升更新频率，提高实时性
+  publish_frequency: 3.0         # 增加发布频率，方便rviz和其他节点使用
+
+  static_map: false
+  rolling_window: true
+
+  width: 3.0
+  height: 3.0
+  resolution: 0.04
+
+  transform_tolerance: 0.3      # 缩短容忍时间，减少因TF延迟导致的问题
+
+  plugins:
+    # - {name: static_layer,    type: "costmap_2d::StaticLayer"} # 本地一般不启用静态层
+    - {name: obstacle_layer,  type: "costmap_2d::ObstacleLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+

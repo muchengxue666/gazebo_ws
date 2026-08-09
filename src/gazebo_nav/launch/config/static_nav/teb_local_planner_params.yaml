@@ -1,0 +1,66 @@
+TebLocalPlannerROS:
+  odom_topic: /odom
+  map_frame: map
+
+  teb_autosize: true
+  dt_ref: 0.30
+  dt_hysteresis: 0.10
+  max_global_plan_lookahead_dist: 1.0
+  global_plan_overwrite_orientation: true
+  global_plan_viapoint_sep: 0.30
+  via_points_ordered: true
+  allow_init_with_backwards_motion: false
+  control_look_ahead_poses: 1
+  feasibility_check_no_poses: -1
+  feasibility_check_lookahead_distance: 1.0
+  min_resolution_collision_check_angular: 0.10
+
+  max_vel_x: 0.35
+  max_vel_x_backwards: 0.01
+  max_vel_y: 0.05
+  max_vel_trans: 0.35
+  max_vel_theta: 0.80
+  acc_lim_x: 0.8
+  acc_lim_y: 0.8
+  acc_lim_theta: 0.8
+
+  xy_goal_tolerance: 0.08
+  yaw_goal_tolerance: 0.20
+  free_goal_vel: false
+  trans_stopped_vel: 0.03
+  theta_stopped_vel: 0.05
+
+  footprint_model:
+    type: polygon
+    vertices: [[0.190, -0.060], [0.145, -0.131], [-0.145, -0.131], [-0.164, -0.066], [-0.164, 0.066], [-0.145, 0.131], [0.145, 0.131], [0.190, 0.060]]
+  is_footprint_dynamic: false
+
+  min_obstacle_dist: 0.08
+  inflation_dist: 0.15
+  include_costmap_obstacles: true
+  include_dynamic_obstacles: false
+  costmap_converter_plugin: ""
+  costmap_obstacles_behind_robot_dist: 1.0
+
+  no_inner_iterations: 2
+  no_outer_iterations: 2
+  optimization_activate: true
+  optimization_verbose: false
+  penalty_epsilon: 0.005
+  weight_max_vel_x: 2.0
+  weight_max_vel_y: 2.0
+  weight_max_vel_theta: 1.0
+  weight_acc_lim_x: 1.0
+  weight_acc_lim_y: 1.0
+  weight_acc_lim_theta: 1.0
+  weight_optimaltime: 1.0
+  weight_obstacle: 50.0
+  weight_inflation: 0.5
+  weight_viapoint: 3.0
+  weight_adapt_factor: 2.0
+
+  enable_homotopy_class_planning: false
+  enable_multithreading: false
+
+  shrink_horizon_backup: true
+  oscillation_recovery: true

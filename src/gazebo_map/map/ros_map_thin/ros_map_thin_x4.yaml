@@ -1,0 +1,6 @@
+image: ros_map_thin_x4.pgm
+resolution: 0.0125
+origin: [-0.500000, -0.500000, 0.000000]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

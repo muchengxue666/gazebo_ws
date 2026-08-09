@@ -1,0 +1,19 @@
+global_costmap:
+  global_frame: map
+  robot_base_frame: base_link
+
+  update_frequency: 1.0          # 建议至少1Hz，保证地图信息及时更新
+  publish_frequency: 1.0         # 地图发布频率同步更新
+
+  static_map: true               # 静态环境建议开启
+  rolling_window: false          # 全局地图不适用滚动窗口
+
+  transform_tolerance: 0.3       # 缩短容忍时间，避免用旧tf
+
+  track_unknown_space: true
+
+  plugins:
+    - {name: static_layer,    type: "costmap_2d::StaticLayer"}
+    - {name: obstacle_layer,  type: "costmap_2d::ObstacleLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+

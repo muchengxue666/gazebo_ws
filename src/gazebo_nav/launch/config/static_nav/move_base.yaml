@@ -1,0 +1,149 @@
+shutdown_costmaps: false
+recovery_behavior_enabled: true
+clearing_rotation_allowed: false
+recovery_behaviors:
+  - {name: clear_local_obstacles, type: clear_costmap_recovery/ClearCostmapRecovery}
+  - {name: rotate_recovery, type: rotate_recovery/RotateRecovery}
+controller_frequency: 5.0
+planner_frequency: 1.0
+planner_patience: 5.0
+controller_patience: 5.0
+oscillation_timeout: 10.0
+oscillation_distance: 0.10
+base_global_planner: global_planner/GlobalPlanner
+base_local_planner: dwa_local_planner/DWAPlannerROS
+
+clear_local_obstacles:
+  reset_distance: 1.0
+  layer_names: [obstacle_layer]
+  affected_maps: local
+  force_updating: true
+
+rotate_recovery:
+  frequency: 10.0
+  sim_granularity: 0.017
+
+TrajectoryPlannerROS:
+  acc_lim_theta: 2.0
+  max_vel_theta: 0.60
+  min_in_place_vel_theta: 0.15
+  yaw_goal_tolerance: 0.20
+
+GlobalPlanner:
+  allow_unknown: false
+  default_tolerance: 0.10
+  cost_factor: 0.5
+  use_dijkstra: true
+  use_quadratic: true
+  use_grid_path: false
+  old_navfn_behavior: false
+
+DWAPlannerROS:
+  global_frame_id: odom
+  holonomic_robot: true
+  acc_lim_x: 0.8
+  acc_lim_y: 0.8
+  acc_lim_theta: 0.8
+  max_vel_x: 0.35
+  min_vel_x: -0.05
+  max_vel_y: 0.05
+  min_vel_y: -0.05
+  max_vel_trans: 0.35
+  min_vel_trans: 0.03
+  max_vel_theta: 0.80
+  min_vel_theta: 0.05
+  trans_stopped_vel: 0.03
+  theta_stopped_vel: 0.05
+  xy_goal_tolerance: 0.08
+  yaw_goal_tolerance: 0.20
+  latch_xy_goal_tolerance: false
+  sim_time: 0.8
+  sim_granularity: 0.025
+  angular_sim_granularity: 0.025
+  vx_samples: 15
+  vy_samples: 3
+  vth_samples: 20
+  path_distance_bias: 32.0
+  goal_distance_bias: 20.0
+  occdist_scale: 0.05
+  forward_point_distance: 0.20
+  stop_time_buffer: 0.20
+  scaling_speed: 0.25
+  max_scaling_factor: 0.20
+  oscillation_reset_dist: 0.10
+  prune_plan: true
+
+common_costmap_params: &common_costmap_params
+  robot_base_frame: base_footprint
+  footprint: [[0.190, -0.060], [0.145, -0.131], [-0.145, -0.131], [-0.164, -0.066], [-0.164, 0.066], [-0.145, 0.131], [0.145, 0.131], [0.190, 0.060]]
+  footprint_padding: 0.0
+  transform_tolerance: 0.3
+
+local_costmap:
+  <<: *common_costmap_params
+  global_frame: odom
+  update_frequency: 5.0
+  publish_frequency: 4.0
+  rolling_window: true
+  width: 2.5
+  height: 2.5
+  resolution: 0.02
+  plugins:
+    - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+  obstacle_layer:
+    enabled: true
+    combination_method: 1
+    footprint_clearing_enabled: true
+    obstacle_range: 2.5
+    raytrace_range: 3.0
+    observation_sources: laser_scan_sensor
+    laser_scan_sensor:
+      sensor_frame: laser_link
+      data_type: LaserScan
+      topic: /scan
+      marking: true
+      clearing: true
+      inf_is_valid: true
+      observation_persistence: 0.0
+      expected_update_rate: 0.20
+  inflation_layer:
+    enabled: true
+    inflation_radius: 0.10
+    cost_scaling_factor: 8.0
+
+global_costmap:
+  <<: *common_costmap_params
+  global_frame: map
+  update_frequency: 2.0
+  publish_frequency: 1.0
+  rolling_window: false
+  track_unknown_space: true
+  plugins:
+    - {name: static_layer, type: "costmap_2d::StaticLayer"}
+    - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
+    - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+  static_layer:
+    enabled: true
+    map_topic: /map
+    subscribe_to_updates: true
+  obstacle_layer:
+    enabled: true
+    combination_method: 1
+    footprint_clearing_enabled: true
+    obstacle_range: 2.5
+    raytrace_range: 3.0
+    observation_sources: laser_scan_sensor
+    laser_scan_sensor:
+      sensor_frame: laser_link
+      data_type: LaserScan
+      topic: /scan
+      marking: true
+      clearing: true
+      inf_is_valid: true
+      observation_persistence: 0.0
+      expected_update_rate: 0.20
+  inflation_layer:
+    enabled: true
+    inflation_radius: 0.32
+    cost_scaling_factor: 5.0

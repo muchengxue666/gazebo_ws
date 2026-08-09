@@ -1,0 +1,38 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="cube">
+    <static>false</static>
+    <link name="link">
+      <inertial>
+        <mass>0.02</mass>
+        <inertia>
+          <ixx>5.33e-06</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>5.33e-06</iyy>
+          <iyz>0</iyz>
+          <izz>5.33e-06</izz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <box><size>0.04 0.04 0.04</size></box>
+        </geometry>
+        <surface>
+          <friction>
+            <ode><mu>1.0</mu><mu2>1.0</mu2></ode>
+          </friction>
+          <contact>
+            <ode><kp>1e6</kp><kd>1e2</kd></ode>
+          </contact>
+        </surface>
+      </collision>
+
+      <visual name="visual">
+        <geometry>
+          <mesh><uri>file:///home/mcx/gazebo_ws/src/car3/models/cube/meshes/cube_0.obj</uri></mesh>
+        </geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>
