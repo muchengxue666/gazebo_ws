@@ -22,7 +22,8 @@
          value="$(find gazebo_map)/map/ros_map_thin/ros_map_world_collision.yaml"/>
   </include>
 
-  <!-- Keep the existing vision test configuration and node unchanged. -->
+  <!-- The vision node keeps the original ROS topic interface while using the
+       bright-silhouette and text-feature classifier implementation. -->
   <node name="cube_vision" pkg="car3" type="cube_vision.py" output="screen">
     <rosparam file="$(find car3)/config/pick_place_task.yaml"
               command="load"/>

@@ -11,6 +11,7 @@
 - `observe` 姿态下机械臂会进入激光雷达扫描平面，已实测无法正常使用 `move_base` 导航；
 - 当前新增受控实验：到固定搜索位姿后，observe 下仅发布零线速度和限速角速度旋转一周；该实验绕过局部规划器碰撞检查，尚未完成 Gazebo 实测；
 - 视觉检测、抓取、运输和释放尚未完成端到端验证；
+- 视觉基线已改为亮度连通域候选 + 类别特有文字 SIFT/RANSAC 匹配；`observe1-6` RGB 离线回归已通过，但仍未完成 Gazebo 静止/旋转实测；
 - 当前第一阶段只处理单个 `food -> cube_0` 物块；
 - daily 投放区域尚未确认，不能直接启用。
 
@@ -19,7 +20,6 @@
 ```text
 src/car3/world/math.world
 src/car3/scripts/spawn_cubes.py
-src/car3/scripts/cube_vision.py
 src/car3/scripts/grasp_attach.py
 ```
 
@@ -499,7 +499,7 @@ RobotModel
 尚未完成：
 
 - 观察点相机视野覆盖验证；
-- 视觉稳定识别；
+- 新视觉算法的 Gazebo 静止/旋转稳定识别；（RGB 离线 `observe1-6` 回归已通过：候选 6/6、类别 6/6、背景裁剪无已知类别误报）
 - 视觉闭环对位；
 - 单物块抓取附着；
 - 抬臂运输；

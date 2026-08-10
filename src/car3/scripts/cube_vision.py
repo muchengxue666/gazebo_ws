@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import collections
 import os
+import sys
 
 import cv2
 import message_filters
@@ -8,23 +9,14 @@ import numpy as np
 import rospy
 import tf2_geometry_msgs
 import tf2_ros
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cube_vision_core import CubeVisionCore
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PointStamped, PoseStamped
 from image_geometry import PinholeCameraModel
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32, String
-
-
-def _order_quad(points):
-    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    ordered = np.zeros((4, 2), dtype=np.float32)
-    sums = points.sum(axis=1)
-    diffs = np.diff(points, axis=1).reshape(-1)
-    ordered[0] = points[np.argmin(sums)]
-    ordered[2] = points[np.argmax(sums)]
-    ordered[1] = points[np.argmin(diffs)]
-    ordered[3] = points[np.argmax(diffs)]
-    return ordered
 
 
 class CubeVision:
@@ -43,20 +35,14 @@ class CubeVision:
         self.processing_rate = float(rospy.get_param('~processing_rate', 5.0))
         self.min_depth = float(rospy.get_param('~min_depth', 0.12))
         self.max_depth = float(rospy.get_param('~max_depth', 1.0))
-        self.min_face_pixels = int(rospy.get_param('~min_face_pixels', 18))
-        self.max_face_pixels = int(rospy.get_param('~max_face_pixels', 180))
-        self.min_quad_area = float(rospy.get_param('~min_quad_area', 260.0))
         self.min_face_size = float(rospy.get_param('~min_face_size', 0.025))
-        self.max_face_size = float(rospy.get_param('~max_face_size', 0.075))
-        self.template_score_threshold = float(
-            rospy.get_param('~template_score_threshold', 0.38))
-        self.template_score_margin = float(
-            rospy.get_param('~template_score_margin', 0.04))
+        self.max_face_size = float(rospy.get_param('~max_face_size', 0.12))
         self.surface_to_center_depth = float(
             rospy.get_param('~surface_to_center_depth', 0.02))
         self.stability_samples = int(rospy.get_param('~stability_samples', 5))
         self.required_votes = int(rospy.get_param('~required_votes', 3))
         self.max_position_std = float(rospy.get_param('~max_position_std', 0.025))
+        self.max_unknown_frames = int(rospy.get_param('~max_unknown_frames', 1))
         self.publish_debug_image = bool(rospy.get_param('~publish_debug_image', True))
         self.depth_debug_max = float(rospy.get_param('~depth_debug_max', 4.0))
         self.rgb_pose_fallback = bool(rospy.get_param('~rgb_pose_fallback', True))
@@ -64,9 +50,42 @@ class CubeVision:
         self.rgb_pose_min_depth = float(rospy.get_param('~rgb_pose_min_depth', 0.05))
         self.rgb_pose_max_depth = float(rospy.get_param('~rgb_pose_max_depth', 0.8))
 
-        self.templates = self._load_templates()
+        core_defaults = (
+            ('brightness_threshold', 80),
+            ('brightness_offset', 20),
+            ('brightness_blur', 0),
+            ('min_candidate_area', 300.0),
+            ('max_candidate_area', 15000.0),
+            ('min_candidate_pixels', 20),
+            ('max_candidate_pixels', 180),
+            ('max_candidate_aspect', 2.5),
+            ('min_candidate_fill', 0.45),
+            ('min_candidate_solidity', 0.82),
+            ('min_dark_fraction', 0.04),
+            ('dark_pixel_offset', 18),
+            ('roi_padding', 4),
+            ('feature_scale', 3.0),
+            ('feature_ratio', 0.74),
+            ('feature_ransac_threshold', 7.0),
+            ('min_feature_matches', 4),
+            ('min_feature_inliers', 4),
+            ('min_template_coverage', 0.008),
+            ('min_roi_coverage', 0.004),
+            ('min_category_margin', 0.45),
+            ('template_category_fraction', 0.55),
+        )
+        core_params = {
+            name: rospy.get_param('~' + name, default)
+            for name, default in core_defaults
+        }
+        try:
+            self.core = CubeVisionCore(self.template_dir, core_params)
+        except RuntimeError as exc:
+            raise rospy.ROSInitException(str(exc))
+
         self.history = collections.deque(maxlen=self.stability_samples)
         self.category_history = collections.deque(maxlen=self.stability_samples)
+        self.unknown_frames = 0
         self.last_process_time = rospy.Time(0)
         self.last_diagnostic_time = rospy.Time(0)
         self.last_candidate_diagnostics = {}
@@ -85,34 +104,8 @@ class CubeVision:
         self.sync.registerCallback(self._image_cb)
 
         rospy.loginfo(
-            'cube_vision ready: frame=%s templates=%s',
-            self.output_frame, ','.join(self.templates.keys()))
-
-    def _load_templates(self):
-        files = {
-            'food': 'Food.png',
-            'daily': 'Daily_Necessities.png',
-            'electronics': 'Electronics.png',
-        }
-        templates = {}
-        for category, filename in files.items():
-            path = os.path.join(self.template_dir, filename)
-            image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if image is None:
-                raise rospy.ROSInitException(
-                    'Cannot load cube template: {}'.format(path))
-            templates[category] = self._prepare_patch(image)
-        return templates
-
-    @staticmethod
-    def _prepare_patch(image):
-        image = cv2.resize(image, (128, 128), interpolation=cv2.INTER_AREA)
-        image = cv2.equalizeHist(image)
-        binary = cv2.adaptiveThreshold(
-            image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 21, 7)
-        return cv2.morphologyEx(
-            binary, cv2.MORPH_OPEN, np.ones((2, 2), dtype=np.uint8))
+            'cube_vision ready: frame=%s classifier=SIFT templates=%s',
+            self.output_frame, ','.join(self.core.templates.keys()))
 
     @staticmethod
     def _depth_in_meters(depth, encoding):
@@ -127,18 +120,15 @@ class CubeVision:
         debug[valid] = np.clip(
             255.0 * (self.depth_debug_max - depth[valid]) / self.depth_debug_max,
             0.0, 255.0).astype(np.uint8)
-        try:
-            msg = Image()
-            msg.header = header
-            msg.height = debug.shape[0]
-            msg.width = debug.shape[1]
-            msg.encoding = 'mono8'
-            msg.is_bigendian = False
-            msg.step = int(debug.strides[0])
-            msg.data = debug.tobytes()
-            self.depth_debug_pub.publish(msg)
-        except CvBridgeError:
-            pass
+        msg = Image()
+        msg.header = header
+        msg.height = debug.shape[0]
+        msg.width = debug.shape[1]
+        msg.encoding = 'mono8'
+        msg.is_bigendian = False
+        msg.step = int(debug.strides[0])
+        msg.data = debug.tobytes()
+        self.depth_debug_pub.publish(msg)
 
     def _image_cb(self, rgb_msg, depth_msg, info_msg):
         now = rospy.Time.now()
@@ -168,32 +158,22 @@ class CubeVision:
         debug = rgb.copy()
 
         if not candidates:
-            if (now - self.last_diagnostic_time).to_sec() > 2.0:
-                rospy.logwarn('cube_vision: no valid cube candidate after geometry/depth filters')
-                self.last_diagnostic_time = now
-            self.history.clear()
-            self.category_history.clear()
+            self._diagnose(now, 'no cube candidate')
+            self._record_unknown_frame()
             self._publish_unknown(0.0)
             self._publish_debug(debug, rgb_msg)
             return
 
-        candidates.sort(key=lambda item: item['score'], reverse=True)
         best = candidates[0]
-        category_scores = sorted(
-            best['category_scores'].values(), reverse=True)
-        category_margin = category_scores[0] - category_scores[1]
-        valid_match = (
-            best['score'] >= self.template_score_threshold
-            and category_margin >= self.template_score_margin)
-
+        valid_match = best['valid_match']
         self._draw_candidate(debug, best, valid_match)
         if not valid_match:
-            self.history.clear()
-            self.category_history.clear()
-            self._publish_unknown(best['score'])
+            self._record_unknown_frame()
+            self._publish_unknown(0.0)
             self._publish_debug(debug, rgb_msg)
             return
 
+        self.unknown_frames = 0
         self.category_history.append((best['category'], best['score']))
         stable_category = self._stable_category_result()
         if stable_category is None:
@@ -211,8 +191,7 @@ class CubeVision:
                     self.history.append((best['category'], best['score'], fallback))
                     stable = self._stable_result()
                     if stable is not None:
-                        _, _, stable_pose = stable
-                        self.pose_pub.publish(stable_pose)
+                        self.pose_pub.publish(stable[2])
                     self._publish_debug(debug, rgb_msg)
                     return
             self.history.clear()
@@ -228,59 +207,15 @@ class CubeVision:
         self.history.append((best['category'], best['score'], pose))
         stable = self._stable_result()
         if stable is not None:
-            _, _, stable_pose = stable
-            self.pose_pub.publish(stable_pose)
+            self.pose_pub.publish(stable[2])
         self._publish_debug(debug, rgb_msg)
 
     def _find_candidates(self, rgb, depth):
-        gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
-        diagnostics = collections.Counter()
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 45, 135)
-        edges = cv2.morphologyEx(
-            edges, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
-        contours, _ = cv2.findContours(
-            edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-        candidates = []
-        for contour in contours:
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter <= 0:
-                continue
-            polygon = cv2.approxPolyDP(contour, 0.035 * perimeter, True)
-            if len(polygon) != 4 or not cv2.isContourConvex(polygon):
-                continue
-            diagnostics['quads'] += 1
-            area = abs(cv2.contourArea(polygon))
-            if area < self.min_quad_area:
-                diagnostics['small_area'] += 1
-                continue
-
-            quad = _order_quad(polygon.reshape(4, 2))
-            widths = [np.linalg.norm(quad[1] - quad[0]),
-                      np.linalg.norm(quad[2] - quad[3])]
-            heights = [np.linalg.norm(quad[3] - quad[0]),
-                       np.linalg.norm(quad[2] - quad[1])]
-            width = float(sum(widths) * 0.5)
-            height = float(sum(heights) * 0.5)
-            short_side = min(width, height)
-            long_side = max(width, height)
-            if (short_side < self.min_face_pixels
-                    or long_side > self.max_face_pixels
-                    or long_side / max(short_side, 1.0) > 2.1):
-                diagnostics['pixel_size'] += 1
-                continue
-
-            center = np.mean(quad, axis=0)
-            if self._duplicate_center(candidates, center, short_side * 0.4):
-                continue
-
-            # Category recognition only requires the RGB quadrilateral. Depth
-            # is evaluated separately below and gates pose publication only.
-            patch = self._warp_patch(gray, quad)
-            category, score, category_scores = self._classify_patch(patch)
-
-            z = self._median_depth(depth, quad, center)
+        candidates, _ = self.core.detect(rgb)
+        diagnostics = collections.Counter(self.core.last_diagnostics)
+        for candidate in candidates:
+            z, valid_depth_pixels = self._median_depth(depth, candidate)
+            candidate['valid_depth_pixels'] = valid_depth_pixels
             position_valid = False
             if z is None:
                 diagnostics['depth_invalid'] += 1
@@ -288,8 +223,8 @@ class CubeVision:
             else:
                 fx = float(self.camera_model.fx())
                 fy = float(self.camera_model.fy())
-                metric_width = width * z / fx
-                metric_height = height * z / fy
+                metric_width = candidate['width'] * z / fx
+                metric_height = candidate['height'] * z / fy
                 if z >= self.max_depth * 0.98:
                     diagnostics['depth_at_config_limit'] += 1
                 elif not (self.min_face_size <= min(metric_width, metric_height)
@@ -298,102 +233,47 @@ class CubeVision:
                 else:
                     position_valid = True
                     diagnostics['position_valid'] += 1
+            candidate['depth'] = z
+            candidate['position_valid'] = position_valid
 
-            candidates.append({
-                'quad': quad,
-                'center': center,
-                'depth': z,
-                'position_valid': position_valid,
-                'category': category,
-                'score': score,
-                'category_scores': category_scores,
-            })
         self.last_candidate_diagnostics = dict(diagnostics)
-        if not candidates and (rospy.Time.now() - self.last_diagnostic_time).to_sec() > 2.0:
-            rospy.logwarn('cube_vision: candidate diagnostics=%s', self.last_candidate_diagnostics)
-            self.last_diagnostic_time = rospy.Time.now()
         return candidates
 
-    @staticmethod
-    def _duplicate_center(candidates, center, threshold):
-        return any(np.linalg.norm(item['center'] - center) < threshold
-                   for item in candidates)
-
-    @staticmethod
-    def _warp_patch(gray, quad):
-        target = np.array(
-            [[0, 0], [127, 0], [127, 127], [0, 127]], dtype=np.float32)
-        transform = cv2.getPerspectiveTransform(quad, target)
-        return cv2.warpPerspective(gray, transform, (128, 128))
-
-    def _classify_patch(self, patch):
-        prepared = self._prepare_patch(patch)
-        scores = {}
-        for category, template in self.templates.items():
-            variants = []
-            rotated = prepared
-            for _ in range(4):
-                variants.append(rotated)
-                variants.append(cv2.flip(rotated, 1))
-                rotated = cv2.rotate(rotated, cv2.ROTATE_90_CLOCKWISE)
-            scores[category] = max(
-                float(cv2.matchTemplate(
-                    variant, template, cv2.TM_CCOEFF_NORMED)[0, 0])
-                for variant in variants)
-        category = max(scores, key=scores.get)
-        return category, scores[category], scores
-
-    def _median_depth(self, depth, quad, center):
-        mask = np.zeros(depth.shape, dtype=np.uint8)
-        inset = center + 0.72 * (quad - center)
-        cv2.fillConvexPoly(mask, np.round(inset).astype(np.int32), 255)
+    def _median_depth(self, depth, candidate):
+        mask = self.core.inset_mask(candidate, scale=0.82)
         values = depth[mask > 0]
         values = values[np.isfinite(values)]
         values = values[(values >= self.min_depth) & (values <= self.max_depth)]
         if values.size < 9:
-            return None
-        return float(np.median(values))
+            return None, int(values.size)
+        return float(np.median(values)), int(values.size)
 
     def _rgb_fallback_pose(self, candidate, header):
-        width = 0.5 * (np.linalg.norm(candidate['quad'][1] - candidate['quad'][0])
-                        + np.linalg.norm(candidate['quad'][2] - candidate['quad'][3]))
-        height = 0.5 * (np.linalg.norm(candidate['quad'][3] - candidate['quad'][0])
-                        + np.linalg.norm(candidate['quad'][2] - candidate['quad'][1]))
-        pixels = max(min(width, height), 1.0)
+        quad = candidate['face_quad']
+        if quad is None:
+            return None
+        widths = (np.linalg.norm(quad[1] - quad[0]),
+                  np.linalg.norm(quad[2] - quad[3]))
+        heights = (np.linalg.norm(quad[3] - quad[0]),
+                   np.linalg.norm(quad[2] - quad[1]))
+        pixels = max(min(0.5 * sum(widths), 0.5 * sum(heights)), 1.0)
         focal = 0.5 * (self.camera_model.fx() + self.camera_model.fy())
         z = focal * self.rgb_cube_size / pixels
         if not self.rgb_pose_min_depth <= z <= self.rgb_pose_max_depth:
             return None
-        u, v = candidate['center']
-        ray = np.asarray(self.camera_model.projectPixelTo3dRay((float(u), float(v))), dtype=np.float64)
-        point = PointStamped()
-        point.header = header
-        point.point.x = float(ray[0] * z / ray[2])
-        point.point.y = float(ray[1] * z / ray[2])
-        point.point.z = float(z)
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.output_frame, header.frame_id, header.stamp,
-                rospy.Duration(0.08))
-            transformed = tf2_geometry_msgs.do_transform_point(point, transform)
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException) as exc:
-            rospy.logwarn_throttle(2.0, 'cube_vision RGB pose TF unavailable: %s', exc)
-            return None
-        pose = PoseStamped()
-        pose.header = transformed.header
-        pose.pose.position = transformed.point
-        pose.pose.orientation.w = 1.0
-        return pose
+        return self._pixel_pose(candidate['center'], z, header, 'RGB pose')
 
     def _candidate_pose(self, candidate, header):
-        u, v = candidate['center']
+        z = candidate['depth'] + self.surface_to_center_depth
+        return self._pixel_pose(candidate['center'], z, header, 'depth pose')
+
+    def _pixel_pose(self, center, z, header, label):
+        u, v = center
         ray = np.asarray(
             self.camera_model.projectPixelTo3dRay((float(u), float(v))),
             dtype=np.float64)
         if abs(ray[2]) < 1e-6:
             return None
-        z = candidate['depth'] + self.surface_to_center_depth
         point = PointStamped()
         point.header = header
         point.point.x = float(ray[0] * z / ray[2])
@@ -406,9 +286,9 @@ class CubeVision:
             transformed = tf2_geometry_msgs.do_transform_point(point, transform)
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as exc:
-            rospy.logwarn_throttle(2.0, 'cube_vision TF unavailable: %s', exc)
+            rospy.logwarn_throttle(
+                2.0, 'cube_vision %s TF unavailable: %s', label, exc)
             return None
-
         pose = PoseStamped()
         pose.header = transformed.header
         pose.pose.position = transformed.point
@@ -453,21 +333,41 @@ class CubeVision:
         confidence = float(np.mean([item[1] for item in matching]))
         return category, confidence, stable_pose
 
+    def _record_unknown_frame(self):
+        self.unknown_frames += 1
+        if self.unknown_frames > self.max_unknown_frames:
+            self.history.clear()
+            self.category_history.clear()
+
     def _publish_unknown(self, confidence):
         self.category_pub.publish(String(data='unknown'))
         self.confidence_pub.publish(
             Float32(data=max(0.0, float(confidence))))
 
+    def _diagnose(self, now, reason):
+        if (now - self.last_diagnostic_time).to_sec() > 2.0:
+            rospy.logwarn(
+                'cube_vision: %s diagnostics=%s',
+                reason, self.last_candidate_diagnostics)
+            self.last_diagnostic_time = now
+
     @staticmethod
     def _draw_candidate(image, candidate, valid):
         color = (0, 200, 0) if valid else (0, 165, 255)
-        quad = np.round(candidate['quad']).astype(np.int32)
-        cv2.polylines(image, [quad], True, color, 2)
+        hull = np.round(candidate['hull']).astype(np.int32)
+        cv2.polylines(image, [hull], True, color, 2)
+        face_quad = candidate['face_quad']
+        if valid and face_quad is not None:
+            cv2.polylines(
+                image, [np.round(face_quad).astype(np.int32)],
+                True, (255, 200, 0), 1)
         x, y = np.round(candidate['center']).astype(int)
         depth_text = ('{:.2f}m'.format(candidate['depth'])
                       if np.isfinite(candidate['depth']) else 'no-depth')
-        label = '{} {:.2f} {}'.format(
-            candidate['category'], candidate['score'], depth_text)
+        details = candidate['match_details'][candidate['category']]
+        label = '{} {:.2f} {}/{} {}'.format(
+            candidate['category'], candidate['score'], details['inliers'],
+            details['matches'], depth_text)
         cv2.putText(image, label, (x + 5, y - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 

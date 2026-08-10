@@ -1,0 +1,7 @@
+samples:
+  - {file: observe1.png, category: daily, bbox: [131, 281, 80, 85]}
+  - {file: observe2.png, category: electronics, bbox: [19, 286, 91, 89]}
+  - {file: observe3.png, category: food, bbox: [20, 359, 86, 74]}
+  - {file: observe4.png, category: daily, bbox: [367, 360, 58, 76]}
+  - {file: observe5.png, category: electronics, bbox: [332, 335, 58, 76]}
+  - {file: observe6.png, category: food, bbox: [388, 377, 61, 70]}

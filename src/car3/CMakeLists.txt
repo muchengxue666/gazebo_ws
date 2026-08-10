@@ -24,3 +24,8 @@ foreach(dir config launch meshes urdf models world)
 	install(DIRECTORY ${dir}/
 		DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/${dir})
 endforeach(dir)
+
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_cube_vision_offline.py)
+endif()

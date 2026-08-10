@@ -32,6 +32,10 @@ for car3 robot</p>
   <exec_depend>actionlib_msgs</exec_depend>
   <exec_depend>move_base_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <test_depend>python3-nose</test_depend>
+  <test_depend>python3-yaml</test_depend>
   <exec_depend>control_msgs</exec_depend>
   <exec_depend>trajectory_msgs</exec_depend>
   <export>

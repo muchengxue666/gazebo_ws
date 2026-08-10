@@ -71,7 +71,7 @@ max_align_step: 0.15
 align_xy_tolerance: 0.012
 align_z_tolerance: 0.03
 # Fixed map pose captured from the successful search-camera setup.
-search_pose: {x: -1.4135, y: -0.4311, yaw: 1.7201}
+search_pose: {x: -1.40, y: -0.4311, yaw: 1.7201}
 # Experimental direct rotation while observe is active. This bypasses
 # move_base collision checking because the lowered arm blocks raw /scan.
 search_settle_time: 0.5
