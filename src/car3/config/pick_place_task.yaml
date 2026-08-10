@@ -18,6 +18,14 @@ min_candidate_solidity: 0.82
 min_dark_fraction: 0.04
 dark_pixel_offset: 18
 roi_padding: 4
+# Depth geometry uses registered RGB/depth pixels and fits the visible face
+# before moving from the surface to the cube center.
+cube_half_size: 0.02
+depth_plane_min_points: 30
+depth_plane_max_residual: 0.004
+# Gazebo's depth sensor has <pose>0 0 0 pi 0 0</pose>, but TF publishes the
+# URDF optical frame without that sensor-local roll.
+sensor_to_optical_rpy: [3.141592653589793, 0.0, 0.0]
 # Category matching uses the distinctive top text and RANSAC-consistent SIFT
 # matches; the shared "物块" text is excluded from the templates.
 feature_scale: 3.0
@@ -30,13 +38,13 @@ min_roi_coverage: 0.004
 min_category_margin: 0.45
 template_category_fraction: 0.55
 max_unknown_frames: 1
-surface_to_center_depth: 0.02
 stability_samples: 5
 required_votes: 3
 max_position_std: 0.025
 publish_debug_image: true
 depth_debug_max: 4.0
-rgb_pose_fallback: true
+# RGB size fallback is retained for diagnostics but is not a reliable grasp pose.
+rgb_pose_fallback: false
 rgb_cube_size: 0.04
 rgb_pose_min_depth: 0.05
 rgb_pose_max_depth: 0.8

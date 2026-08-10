@@ -13,6 +13,7 @@ catkin_install_python(PROGRAMS
   scripts/grasp_attach.py
   scripts/spawn_cubes.py
   scripts/cube_vision.py
+  scripts/calibrate_vision_ground_truth.py
   scripts/test_observe_grasp.py
   scripts/pick_place_executor.py
   scripts/test_move_base_goal.py

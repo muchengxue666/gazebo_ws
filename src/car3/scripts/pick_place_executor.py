@@ -3,6 +3,7 @@ import math
 import time
 
 import actionlib
+import numpy as np
 import rospy
 import tf.transformations as transformations
 import tf2_geometry_msgs
@@ -15,6 +16,7 @@ from control_msgs.msg import (
 )
 from gazebo_msgs.srv import GetModelState
 from geometry_msgs.msg import (
+    Point,
     PointStamped,
     PoseWithCovarianceStamped,
     PoseStamped,
@@ -69,9 +71,40 @@ class PickPlaceExecutor:
         self.max_align_step = float(rospy.get_param('~max_align_step', 0.15))
         self.align_xy_tolerance = float(
             rospy.get_param('~align_xy_tolerance', 0.012))
+        self.fine_align_distance = float(
+            rospy.get_param('~fine_align_distance', 0.08))
+        self.fine_align_timeout = float(
+            rospy.get_param('~fine_align_timeout', 8.0))
+        self.fine_align_rate = float(
+            rospy.get_param('~fine_align_rate', 20.0))
+        self.fine_align_max_linear_speed = float(
+            rospy.get_param('~fine_align_max_linear_speed', 0.04))
+        self.fine_align_max_angular_speed = float(
+            rospy.get_param('~fine_align_max_angular_speed', 0.30))
+        self.fine_align_linear_gain = float(
+            rospy.get_param('~fine_align_linear_gain', 0.8))
+        self.fine_align_angular_gain = float(
+            rospy.get_param('~fine_align_angular_gain', 0.8))
+        self.fine_align_yaw_tolerance = float(
+            rospy.get_param('~fine_align_yaw_tolerance', 0.04))
         self.align_z_tolerance = float(
             rospy.get_param('~align_z_tolerance', 0.03))
         self.search_pose = rospy.get_param('~search_pose', {})
+        self.search_waypoints = rospy.get_param(
+            '~search_waypoints', [self.search_pose])
+        self.search_areas = rospy.get_param('~search_areas', {})
+        self.vision_reset_service = rospy.get_param(
+            '~vision_reset_service', '/cube_vision/reset')
+        self.align_fresh_pose_samples = int(
+            rospy.get_param('~align_fresh_pose_samples', 3))
+        self.align_fresh_pose_timeout = float(
+            rospy.get_param('~align_fresh_pose_timeout', 3.0))
+        self.align_fresh_pose_max_span = float(
+            rospy.get_param('~align_fresh_pose_max_span', 0.02))
+        self.align_settle_time = float(
+            rospy.get_param('~align_settle_time', 0.5))
+        self.max_grasp_offset = float(
+            rospy.get_param('~max_grasp_offset', 0.015))
         self.search_rotation_speed = float(
             rospy.get_param('~search_rotation_speed', 0.20))
         self.search_rotation_angle = float(
@@ -122,6 +155,8 @@ class PickPlaceExecutor:
         self.vision_pose_category = 'unknown'
         self.vision_pose_confidence = 0.0
         self.vision_pose_received = rospy.Time(0)
+        self.vision_pose_seq = 0
+        self.vision_reset = None
         self.seen_non_target_cubes = []
         self.search_detection_dedupe_distance = float(
             rospy.get_param('~search_detection_dedupe_distance', 0.05))
@@ -129,6 +164,7 @@ class PickPlaceExecutor:
         self.grasp_state = 'IDLE'
         self.attached_model = ''
         self.attach_offset = None
+        self.attach_offset_history = []
         self.grasp_tcp_in_base = None
         self.transport_tcp_in_base = None
         self.place_tcp_in_base = None
@@ -153,7 +189,11 @@ class PickPlaceExecutor:
             '~result', String, queue_size=1, latch=True)
         self.detected_category_pub = rospy.Publisher(
             '~detected_category', String, queue_size=1, latch=True)
+        self.detected_area_pub = rospy.Publisher(
+            '~detected_area', String, queue_size=1, latch=True)
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
+        self.vision_reset = rospy.ServiceProxy(
+            self.vision_reset_service, Empty)
 
         rospy.Subscriber('/joint_states', JointState, self._joint_cb)
         self._readiness_subscribers.extend([
@@ -175,6 +215,7 @@ class PickPlaceExecutor:
         rospy.Subscriber('/grasp_attach/state', String, self._grasp_state_cb)
         rospy.Subscriber(
             '/grasp_attach/attached_model', String, self._attached_model_cb)
+        rospy.Subscriber('/grasp_attach/offset', Point, self._offset_cb)
 
         rospy.on_shutdown(self._cancel_actions)
         self._validate_config()
@@ -196,6 +237,22 @@ class PickPlaceExecutor:
         if not self._inside_map(
                 float(self.search_pose['x']), float(self.search_pose['y'])):
             raise rospy.ROSInitException('search_pose is outside map bounds')
+        if (not isinstance(self.search_waypoints, list)
+                or not self.search_waypoints):
+            raise rospy.ROSInitException('search_waypoints is empty')
+        for index, waypoint in enumerate(self.search_waypoints):
+            if (not isinstance(waypoint, dict)
+                    or any(key not in waypoint for key in ('x', 'y', 'yaw'))):
+                raise rospy.ROSInitException(
+                    'search_waypoints[{}] is incomplete'.format(index))
+            if not all(math.isfinite(float(waypoint[key]))
+                        for key in ('x', 'y', 'yaw')):
+                raise rospy.ROSInitException(
+                    'search_waypoints[{}] contains invalid values'.format(index))
+            if not self._inside_map(
+                    float(waypoint['x']), float(waypoint['y'])):
+                raise rospy.ROSInitException(
+                    'search_waypoints[{}] is outside map bounds'.format(index))
         if (not math.isfinite(self.search_rotation_speed)
                 or self.search_rotation_speed == 0.0):
             raise rospy.ROSInitException(
@@ -214,6 +271,19 @@ class PickPlaceExecutor:
         if self.search_rotation_angle > 2.0 * math.pi + 0.01:
             raise rospy.ROSInitException(
                 'search_rotation_angle must not exceed one revolution')
+        for name, value in (
+                ('fine_align_distance', self.fine_align_distance),
+                ('fine_align_timeout', self.fine_align_timeout),
+                ('fine_align_rate', self.fine_align_rate),
+                ('fine_align_max_linear_speed',
+                 self.fine_align_max_linear_speed),
+                ('fine_align_max_angular_speed',
+                 self.fine_align_max_angular_speed),
+                ('fine_align_linear_gain', self.fine_align_linear_gain),
+                ('fine_align_angular_gain', self.fine_align_angular_gain),
+                ('fine_align_yaw_tolerance', self.fine_align_yaw_tolerance)):
+            if not math.isfinite(value) or value <= 0.0:
+                raise rospy.ROSInitException(name + ' must be positive')
         for name in ('navigation', 'observe', 'grasp', 'transport', 'place'):
             self._read_arm_pose(name)
         for name, value in (
@@ -280,6 +350,7 @@ class PickPlaceExecutor:
         self.vision_pose_category = self.category
         self.vision_pose_confidence = self.confidence
         self.vision_pose_received = rospy.Time.now()
+        self.vision_pose_seq += 1
 
     def _ready_cb(self, msg):
         self.ready = bool(msg.data)
@@ -289,6 +360,9 @@ class PickPlaceExecutor:
 
     def _attached_model_cb(self, msg):
         self.attached_model = msg.data
+
+    def _offset_cb(self, msg):
+        self.attach_offset = (float(msg.x), float(msg.y), float(msg.z))
 
     def _set_state(self, state):
         rospy.loginfo('pick_place state: %s', state)
@@ -533,6 +607,56 @@ class PickPlaceExecutor:
             return detection[1]
         return None
 
+    def _classify_search_area(self, pose):
+        point = self._point_in_frame(pose, 'map').point
+        matches = []
+        margin = float(rospy.get_param('~search_area_match_margin', 0.03))
+        for name, bounds in self.search_areas.items():
+            if all(key in bounds for key in ('x_min', 'x_max', 'y_min', 'y_max')):
+                if (float(bounds['x_min']) - margin <= point.x <= float(bounds['x_max']) + margin
+                        and float(bounds['y_min']) - margin <= point.y <= float(bounds['y_max']) + margin):
+                    matches.append(name)
+        if len(matches) != 1:
+            raise RuntimeError(
+                'vision target is not uniquely inside a search area: map=(%.3f, %.3f)' %
+                (point.x, point.y))
+        area = matches[0]
+        self.detected_area_pub.publish(String(data=area))
+        rospy.loginfo('vision target area=%s map=(%.3f, %.3f)', area, point.x, point.y)
+        return area
+
+    def _fresh_target_pose(self, barrier_seq, timeout=None):
+        timeout = self.align_fresh_pose_timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
+        samples = []
+        accepted_seq = barrier_seq
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            if self.vision_pose_seq > accepted_seq:
+                detection = self._current_detection()
+                accepted_seq = self.vision_pose_seq
+                if detection is not None:
+                    point = self._point_in_frame(detection, 'map').point
+                    samples.append((point.x, point.y, point.z, detection))
+                    if len(samples) >= self.align_fresh_pose_samples:
+                        values = np.asarray([
+                            [s[0], s[1], s[2]]
+                            for s in samples[-self.align_fresh_pose_samples:]])
+                        if np.max(np.ptp(values, axis=0)) <= self.align_fresh_pose_max_span:
+                            return samples[-1][3]
+            rospy.sleep(0.05)
+        return None
+
+    def _reset_vision_and_observe(self):
+        self._stop_base()
+        time.sleep(self.align_settle_time)
+        self._move_arm('observe')
+        barrier = self.vision_pose_seq
+        try:
+            self.vision_reset()
+        except rospy.ServiceException as exc:
+            rospy.logwarn('vision reset failed: %s', exc)
+        return self._fresh_target_pose(barrier)
+
     def _is_seen_non_target(self, category, pose):
         point = self._point_in_frame(pose, 'map').point
         for seen_category, seen_x, seen_y in self.seen_non_target_cubes:
@@ -653,21 +777,25 @@ class PickPlaceExecutor:
         rospy.logwarn('%s navigation failed', label)
         return False
 
-    def _search(self):
-        self._set_state('SEARCH_SOURCE')
-        search_x = float(self.search_pose['x'])
-        search_y = float(self.search_pose['y'])
-        search_yaw = float(self.search_pose['yaw'])
-        if not self._navigate(
-                search_x, search_y, search_yaw, 'fixed search pose', retries=0):
-            raise RuntimeError('fixed search pose navigation failed')
-
+    def _search_at_waypoint(self, waypoint, index):
+        search_x = float(waypoint['x'])
+        search_y = float(waypoint['y'])
+        search_yaw = float(waypoint['yaw'])
+        label = 'search waypoint {}'.format(index)
+        if not self._navigate(search_x, search_y, search_yaw, label, retries=0):
+            rospy.logwarn('%s navigation failed; trying next waypoint', label)
+            return None
         self._stop_base()
         time.sleep(self.search_settle_time)
         self._move_arm('observe')
         since_received = self.vision_pose_received
         pose = self._current_detection(since_received)
         if pose is not None:
+            self._stop_base()
+            fresh_pose = self._reset_vision_and_observe()
+            if fresh_pose is not None:
+                return fresh_pose
+            rospy.logwarn('fresh stationary target pose unavailable at %s', label)
             return pose
 
         self._set_state('ROTATE_SEARCH')
@@ -725,53 +853,179 @@ class PickPlaceExecutor:
         self._move_arm('navigation')
         if rospy.is_shutdown():
             raise RuntimeError('search rotation interrupted by shutdown')
-        if time.monotonic() >= deadline:
-            raise RuntimeError('search rotation timeout')
-        raise RuntimeError('target was not detected during one search revolution')
+        rospy.loginfo('%s completed without target; continuing search', label)
+        return None
 
-    def _align_to_grasp(self, first_pose):
-        self._set_state('ALIGN_TO_GRASP')
-        # Vision acquisition happened with the arm lowered and the base parked.
-        # Raise the arm before any base motion so it cannot enter the laser scan
-        # plane; the grasp posture is restored only after alignment converges.
-        self._move_arm('navigation')
-        target = self._point_in_frame(first_pose, 'map').point
+    def _search(self):
+        self._set_state('SEARCH_SOURCE')
+        for index, waypoint in enumerate(self.search_waypoints):
+            pose = self._search_at_waypoint(waypoint, index)
+            if pose is not None:
+                return pose
+        raise RuntimeError(
+            'target was not detected at any configured search waypoint')
+
+    @staticmethod
+    def _clamp(value, limit):
+        return max(-limit, min(limit, value))
+
+    def _fine_align_to_grasp(self, target_map, rotate=True):
+        """Close the final gap with bounded base velocity feedback.
+
+        ``target_map`` is stationary in the map frame.  The target grasp pose
+        is recomputed from the live map->base TF on every cycle, so this loop
+        corrects odometry/controller error without asking move_base to solve a
+        centimeter-scale goal.
+        """
+        self._set_state('FINE_ALIGN_TO_GRASP')
+        deadline = time.monotonic() + self.fine_align_timeout
+        period = 1.0 / self.fine_align_rate
         desired_x, desired_y, _ = self.grasp_tcp_in_base
+        desired_tcp_angle = math.atan2(desired_y, desired_x)
+        command = Twist()
+        try:
+            while not rospy.is_shutdown() and time.monotonic() < deadline:
+                base_x, base_y, base_yaw = self._base_pose_map()
+                target_bearing = math.atan2(
+                    target_map.y - base_y, target_map.x - base_x)
+                grasp_yaw = self._wrap_angle(target_bearing - desired_tcp_angle)
+                cos_yaw = math.cos(grasp_yaw)
+                sin_yaw = math.sin(grasp_yaw)
+                goal_x = target_map.x - (
+                    cos_yaw * desired_x - sin_yaw * desired_y)
+                goal_y = target_map.y - (
+                    sin_yaw * desired_x + cos_yaw * desired_y)
+                error_map_x = goal_x - base_x
+                error_map_y = goal_y - base_y
+                error_xy = math.hypot(error_map_x, error_map_y)
+                yaw_error = self._wrap_angle(grasp_yaw - base_yaw)
+                rospy.loginfo_throttle(
+                    1.0,
+                    'fine alignment error: xy=%.3f yaw=%.3f',
+                    error_xy, yaw_error)
+                if (error_xy <= self.align_xy_tolerance
+                        and (not rotate
+                             or abs(yaw_error) <= self.fine_align_yaw_tolerance)):
+                    return
+                if error_xy > self.fine_align_distance:
+                    raise RuntimeError(
+                        'fine alignment error exceeded limit: {:.3f} m'.format(
+                            error_xy))
+
+                # Convert map-frame position error to the base frame expected
+                # by /cmd_vel.  Proportional control is capped for safety.
+                cos_base = math.cos(base_yaw)
+                sin_base = math.sin(base_yaw)
+                error_base_x = (cos_base * error_map_x
+                                + sin_base * error_map_y)
+                error_base_y = (-sin_base * error_map_x
+                                + cos_base * error_map_y)
+                command.linear.x = self._clamp(
+                    self.fine_align_linear_gain * error_base_x,
+                    self.fine_align_max_linear_speed)
+                command.linear.y = self._clamp(
+                    self.fine_align_linear_gain * error_base_y,
+                    self.fine_align_max_linear_speed)
+                command.angular.z = (self._clamp(
+                    self.fine_align_angular_gain * yaw_error,
+                    self.fine_align_max_angular_speed) if rotate else 0.0)
+                self.cmd_vel_pub.publish(command)
+                time.sleep(period)
+        finally:
+            self._stop_base()
+        raise RuntimeError('fine alignment timed out')
+
+    @staticmethod
+    def _wrap_angle(angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    def _align_to_grasp_with_fine_tolerance(self, first_pose):
+        self._set_state('ALIGN_TO_GRASP')
+        target_pose = first_pose
+        self._classify_search_area(target_pose)
+        first_target = self._point_in_frame(target_pose, 'map').point
+        first_base_x, first_base_y, first_base_yaw = self._base_pose_map()
+        first_bearing = math.atan2(
+            first_target.y - first_base_y, first_target.x - first_base_x)
+        observe_yaw_offset = self._wrap_angle(first_bearing - first_base_yaw)
+        desired_x, desired_y, _ = self.grasp_tcp_in_base
+        desired_tcp_angle = math.atan2(desired_y, desired_x)
         for iteration in range(self.max_align_iterations + 1):
-            base_x, base_y, base_yaw = self._base_pose_map()
-            cos_yaw = math.cos(base_yaw)
-            sin_yaw = math.sin(base_yaw)
-            local_x = cos_yaw * (target.x - base_x) + sin_yaw * (target.y - base_y)
-            local_y = -sin_yaw * (target.x - base_x) + cos_yaw * (target.y - base_y)
-            error_x = local_x - desired_x
-            error_y = local_y - desired_y
+            self._move_arm('navigation')
+            target = self._point_in_frame(target_pose, 'map').point
+            base_x, base_y, _ = self._base_pose_map()
+            target_bearing = math.atan2(target.y - base_y, target.x - base_x)
+            grasp_yaw = self._wrap_angle(target_bearing - desired_tcp_angle)
+            cos_yaw = math.cos(grasp_yaw)
+            sin_yaw = math.sin(grasp_yaw)
+            goal_x = target.x - (cos_yaw * desired_x - sin_yaw * desired_y)
+            goal_y = target.y - (sin_yaw * desired_x + cos_yaw * desired_y)
+            error_x = goal_x - base_x
+            error_y = goal_y - base_y
             error_xy = math.hypot(error_x, error_y)
             rospy.loginfo(
-                'alignment %d: cube_base=(%.3f, %.3f) error=(%.3f, %.3f)',
-                iteration, local_x, local_y, error_x, error_y)
-            if error_xy <= self.align_xy_tolerance:
+                'alignment %d: target=(%.3f, %.3f) goal=(%.3f, %.3f) '
+                'error=%.3f grasp_yaw=%.3f',
+                iteration, target.x, target.y, goal_x, goal_y,
+                error_xy, grasp_yaw)
+            if error_xy <= self.fine_align_distance:
+                # First close the translational gap while preserving the
+                # observation heading, so the cube remains in camera view.
+                self._fine_align_to_grasp(target, rotate=False)
+                refreshed_pose = self._reset_vision_and_observe()
+                if refreshed_pose is None:
+                    rospy.logwarn(
+                        'fresh vision pose unavailable after translational '
+                        'fine alignment; using last stable map pose')
+                    refreshed_target = target
+                else:
+                    refreshed_target = self._point_in_frame(
+                        refreshed_pose, 'map').point
+                # The final yaw correction happens with the arm raised; no
+                # further camera observation is needed after this rotation.
+                self._move_arm('navigation')
+                self._fine_align_to_grasp(refreshed_target, rotate=True)
                 return
             if iteration >= self.max_align_iterations:
                 break
-
             scale = min(1.0, self.max_align_step / error_xy)
-            goal_x = base_x + scale * (target.x - base_x)
-            goal_y = base_y + scale * (target.y - base_y)
+            step_x = base_x + scale * error_x
+            step_y = base_y + scale * error_y
+            step_bearing = math.atan2(target.y - step_y, target.x - step_x)
+            observe_yaw = self._wrap_angle(step_bearing - observe_yaw_offset)
             if not self._navigate(
-                    goal_x, goal_y, base_yaw,
+                    step_x, step_y, observe_yaw,
                     'visual alignment {}'.format(iteration), retries=0):
                 raise RuntimeError('visual alignment navigation failed')
+            self._stop_base()
+            refreshed_pose = self._reset_vision_and_observe()
+            if refreshed_pose is None:
+                # The lowered camera can lose the cube during a coarse move.
+                # The map-frame pose remains valid for this short, bounded
+                # correction; a fresh observation is still mandatory after
+                # the final fine alignment below.
+                rospy.logwarn(
+                    'fresh vision pose unavailable after coarse alignment; '
+                    'continuing with last stable map pose')
+            else:
+                target_pose = refreshed_pose
         raise RuntimeError('visual alignment did not converge')
+
+    def _align_to_grasp(self, first_pose):
+        self._align_to_grasp_with_fine_tolerance(first_pose)
 
     def _prepare_stationary_grasp(self):
         self._set_state('PREPARE_GRASP')
         self._move_arm('grasp')
-        deadline = rospy.Time.now() + rospy.Duration(3.0)
-        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-            if self.ready:
+        deadline = time.monotonic() + 3.0
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            if (self.ready and self.attach_offset is not None
+                    and max(abs(value) for value in self.attach_offset)
+                    <= self.max_grasp_offset):
                 return
             rospy.sleep(0.05)
-        raise RuntimeError('object is not inside the tcp grasp box after alignment')
+        raise RuntimeError(
+            'object is not stably inside the conservative tcp grasp box')
 
     def _wait_attach(self):
         expected = self.category_to_model[self.target_category]

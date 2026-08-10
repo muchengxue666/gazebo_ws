@@ -9,7 +9,8 @@ category_to_model:
   daily: cube_1
   electronics: cube_2
 
-# These are search-area priors from spawn_cubes.py, not fixed cube poses.
+# These are search-area priors from spawn_cubes.py, not fixed cube poses or
+# fixed grasp stations. The detected map Pose is the grasp target.
 search_areas:
   area_a: {x_min: -2.10, x_max: -1.92, y_min: -0.61, y_max: -0.28}
   area_b: {x_min: -1.56, x_max: -1.23, y_min: -0.01, y_max: 0.17}
@@ -66,12 +67,38 @@ navigation_min_costmap_updates: 3
 attach_timeout: 5.0
 release_timeout: 5.0
 nav_retries: 1
-max_align_iterations: 6
+max_align_iterations: 2
 max_align_step: 0.15
 align_xy_tolerance: 0.012
-align_z_tolerance: 0.03
+# Last 8 cm use bounded low-speed /cmd_vel feedback; move_base handles the
+# preceding coarse alignment.
+fine_align_distance: 0.08
+fine_align_timeout: 10.0
+fine_align_rate: 20.0
+fine_align_max_linear_speed: 0.04
+fine_align_max_angular_speed: 0.30
+fine_align_linear_gain: 0.8
+fine_align_angular_gain: 0.8
+fine_align_yaw_tolerance: 0.04
+align_z_tolerance: 0.015
+align_fresh_pose_samples: 3
+align_fresh_pose_timeout: 3.0
+align_fresh_pose_max_span: 0.02
+align_settle_time: 0.5
+max_grasp_offset: 0.015
+vision_reset_service: /cube_vision/reset
+# spawn_cubes ranges are expressed in Gazebo world, while detections are in
+# AMCL map; allow the observed map/world localization offset in simulation.
+search_area_match_margin: 0.10
 # Fixed map pose captured from the successful search-camera setup.
 search_pose: {x: -1.40, y: -0.4311, yaw: 1.7201}
+# Search in order. The first waypoint is the verified pose; the latter two
+# are conservative area-B/area-C candidates and must remain navigation-arm
+# poses until their camera coverage is confirmed.
+search_waypoints:
+  - {x: -1.40, y: -0.4311, yaw: 1.7201}
+  - {x: -1.40, y: -0.20, yaw: 1.5708}
+  - {x: -1.20, y: -0.53, yaw: 0.0}
 # Experimental direct rotation while observe is active. This bypasses
 # move_base collision checking because the lowered arm blocks raw /scan.
 search_settle_time: 0.5
@@ -87,6 +114,8 @@ drop_settle_samples: 5
 drop_settle_delta: 0.01
 joint_tolerance: 0.03
 goal_time_tolerance: 1.5
-settle_position_delta: 0.002
+# Gazebo joint-state samples show ~0.0024 rad controller quantization near
+# the target; use a tolerance above that noise floor for settling.
+settle_position_delta: 0.01
 settle_timeout: 2.0
 settle_samples: 5

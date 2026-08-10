@@ -7,6 +7,7 @@ import cv2
 import message_filters
 import numpy as np
 import rospy
+import tf.transformations as transformations
 import tf2_geometry_msgs
 import tf2_ros
 
@@ -17,6 +18,23 @@ from geometry_msgs.msg import PointStamped, PoseStamped
 from image_geometry import PinholeCameraModel
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Float32, String
+from std_srvs.srv import Empty, EmptyResponse
+
+
+class DepthImageFilter(message_filters.SimpleFilter):
+    """Forward only metric single-channel images from a mixed Gazebo topic."""
+
+    VALID_ENCODINGS = frozenset(('32FC1', '16UC1', 'mono16'))
+
+    def __init__(self, topic):
+        super().__init__()
+        self.subscriber = rospy.Subscriber(
+            topic, Image, self._callback, queue_size=1,
+            buff_size=640 * 480 * 16)
+
+    def _callback(self, msg):
+        if msg.encoding in self.VALID_ENCODINGS:
+            self.signalMessage(msg)
 
 
 class CubeVision:
@@ -37,8 +55,22 @@ class CubeVision:
         self.max_depth = float(rospy.get_param('~max_depth', 1.0))
         self.min_face_size = float(rospy.get_param('~min_face_size', 0.025))
         self.max_face_size = float(rospy.get_param('~max_face_size', 0.12))
-        self.surface_to_center_depth = float(
-            rospy.get_param('~surface_to_center_depth', 0.02))
+        self.cube_half_size = float(rospy.get_param('~cube_half_size', 0.02))
+        self.depth_plane_min_points = int(
+            rospy.get_param('~depth_plane_min_points', 30))
+        self.depth_plane_max_residual = float(
+            rospy.get_param('~depth_plane_max_residual', 0.004))
+        # The Gazebo depth sensor has an additional pi roll in its SDF pose,
+        # while robot_state_publisher only exposes the URDF optical frame.
+        # Convert points from the rendered sensor frame into that TF frame
+        # before applying camera_depth_optical_frame -> output_frame.
+        sensor_rpy = rospy.get_param(
+            '~sensor_to_optical_rpy', [3.141592653589793, 0.0, 0.0])
+        if not isinstance(sensor_rpy, (list, tuple)) or len(sensor_rpy) != 3:
+            raise rospy.ROSInitException('sensor_to_optical_rpy must have 3 values')
+        self.sensor_to_optical = np.asarray(
+            transformations.euler_matrix(*[float(value) for value in sensor_rpy])[:3, :3],
+            dtype=np.float64)
         self.stability_samples = int(rospy.get_param('~stability_samples', 5))
         self.required_votes = int(rospy.get_param('~required_votes', 3))
         self.max_position_std = float(rospy.get_param('~max_position_std', 0.025))
@@ -95,17 +127,28 @@ class CubeVision:
         self.pose_pub = rospy.Publisher('~pose', PoseStamped, queue_size=1)
         self.debug_pub = rospy.Publisher('~debug_image', Image, queue_size=1)
         self.depth_debug_pub = rospy.Publisher('~depth_debug', Image, queue_size=1)
+        self.reset_srv = rospy.Service('~reset', Empty, self._reset_cb)
 
         rgb_sub = message_filters.Subscriber('/camera/rgb/image_raw', Image)
-        depth_sub = message_filters.Subscriber('/depth_camera/depth/image_raw', Image)
-        info_sub = message_filters.Subscriber(self.camera_info_topic, CameraInfo)
+        depth_sub = DepthImageFilter('/depth_camera/depth/image_raw')
+        rgb_info_sub = message_filters.Subscriber(
+            self.camera_info_topic, CameraInfo)
+        # Gazebo's depth-camera plugin in ROS Noetic does not publish its
+        # depth CameraInfo topic. RGB and depth are co-located and configured
+        # with the same image geometry in car3.urdf, so they share this model.
         self.sync = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub, info_sub], queue_size=8, slop=0.08)
+            [rgb_sub, depth_sub, rgb_info_sub], queue_size=8, slop=0.08)
         self.sync.registerCallback(self._image_cb)
 
         rospy.loginfo(
             'cube_vision ready: frame=%s classifier=SIFT templates=%s',
             self.output_frame, ','.join(self.core.templates.keys()))
+
+    def _reset_cb(self, _request):
+        self.history.clear()
+        self.category_history.clear()
+        self.unknown_frames = 0
+        return EmptyResponse()
 
     @staticmethod
     def _depth_in_meters(depth, encoding):
@@ -130,7 +173,7 @@ class CubeVision:
         msg.data = debug.tobytes()
         self.depth_debug_pub.publish(msg)
 
-    def _image_cb(self, rgb_msg, depth_msg, info_msg):
+    def _image_cb(self, rgb_msg, depth_msg, camera_info_msg):
         now = rospy.Time.now()
         if (now - self.last_process_time).to_sec() < 1.0 / self.processing_rate:
             return
@@ -146,14 +189,34 @@ class CubeVision:
             return
 
         depth = self._depth_in_meters(raw_depth, depth_msg.encoding)
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth = depth[:, :, 0]
         self._publish_depth_debug(depth, depth_msg.header)
+        if depth.ndim != 2:
+            rospy.logwarn_throttle(
+                2.0, 'unsupported depth image shape: %s', depth.shape)
+            return
         if depth.shape[:2] != rgb.shape[:2]:
             rospy.logwarn_throttle(
                 2.0, 'RGB/depth dimensions differ: %s vs %s',
                 rgb.shape[:2], depth.shape[:2])
             return
 
-        self.camera_model.fromCameraInfo(info_msg)
+        if (camera_info_msg.width != rgb.shape[1]
+                or camera_info_msg.height != rgb.shape[0]):
+            rospy.logwarn_throttle(
+                2.0, 'CameraInfo/image dimensions differ: info=%dx%d image=%dx%d',
+                camera_info_msg.width, camera_info_msg.height,
+                rgb.shape[1], rgb.shape[0])
+            return
+        if (depth_msg.header.frame_id
+                and camera_info_msg.header.frame_id
+                and depth_msg.header.frame_id != camera_info_msg.header.frame_id):
+            rospy.logwarn_throttle(
+                2.0, 'RGB/depth frame mismatch: depth=%s info=%s',
+                depth_msg.header.frame_id, camera_info_msg.header.frame_id)
+            return
+        self.camera_model.fromCameraInfo(camera_info_msg)
         candidates = self._find_candidates(rgb, depth)
         debug = rgb.copy()
 
@@ -186,7 +249,7 @@ class CubeVision:
 
         if not best['position_valid']:
             if self.rgb_pose_fallback:
-                fallback = self._rgb_fallback_pose(best, info_msg.header)
+                fallback = self._rgb_fallback_pose(best, depth_msg.header)
                 if fallback is not None:
                     self.history.append((best['category'], best['score'], fallback))
                     stable = self._stable_result()
@@ -198,7 +261,7 @@ class CubeVision:
             self._publish_debug(debug, rgb_msg)
             return
 
-        pose = self._candidate_pose(best, info_msg.header)
+        pose = self._candidate_pose(best, depth_msg.header)
         if pose is None:
             self.history.clear()
             self._publish_debug(debug, rgb_msg)
@@ -213,40 +276,39 @@ class CubeVision:
     def _find_candidates(self, rgb, depth):
         candidates, _ = self.core.detect(rgb)
         diagnostics = collections.Counter(self.core.last_diagnostics)
+        camera_matrix = np.asarray(
+            self.camera_model.intrinsicMatrix(), dtype=np.float64)
         for candidate in candidates:
-            z, valid_depth_pixels = self._median_depth(depth, candidate)
-            candidate['valid_depth_pixels'] = valid_depth_pixels
+            depth_geometry = self.core.estimate_cube_center(
+                depth, self.core.inset_mask(candidate, scale=0.82),
+                camera_matrix, self.cube_half_size,
+                self.min_depth, self.max_depth,
+                self.depth_plane_min_points,
+                self.depth_plane_max_residual)
             position_valid = False
-            if z is None:
-                diagnostics['depth_invalid'] += 1
-                z = float('nan')
+            if depth_geometry is None:
+                diagnostics['depth_plane_invalid'] += 1
+                candidate['depth'] = float('nan')
+                candidate['valid_depth_pixels'] = 0
+                candidate['camera_center'] = None
             else:
-                fx = float(self.camera_model.fx())
-                fy = float(self.camera_model.fy())
-                metric_width = candidate['width'] * z / fx
-                metric_height = candidate['height'] * z / fy
-                if z >= self.max_depth * 0.98:
-                    diagnostics['depth_at_config_limit'] += 1
-                elif not (self.min_face_size <= min(metric_width, metric_height)
-                          and max(metric_width, metric_height) <= self.max_face_size):
+                z = depth_geometry['depth']
+                metric_width = candidate['width'] * z / float(self.camera_model.fx())
+                metric_height = candidate['height'] * z / float(self.camera_model.fy())
+                candidate['depth'] = z
+                candidate['valid_depth_pixels'] = depth_geometry['valid_points']
+                candidate['depth_residual'] = depth_geometry['residual_rms']
+                candidate['camera_center'] = depth_geometry['center']
+                if not (self.min_face_size <= min(metric_width, metric_height)
+                        and max(metric_width, metric_height) <= self.max_face_size):
                     diagnostics['metric_size'] += 1
                 else:
                     position_valid = True
                     diagnostics['position_valid'] += 1
-            candidate['depth'] = z
             candidate['position_valid'] = position_valid
 
         self.last_candidate_diagnostics = dict(diagnostics)
         return candidates
-
-    def _median_depth(self, depth, candidate):
-        mask = self.core.inset_mask(candidate, scale=0.82)
-        values = depth[mask > 0]
-        values = values[np.isfinite(values)]
-        values = values[(values >= self.min_depth) & (values <= self.max_depth)]
-        if values.size < 9:
-            return None, int(values.size)
-        return float(np.median(values)), int(values.size)
 
     def _rgb_fallback_pose(self, candidate, header):
         quad = candidate['face_quad']
@@ -264,8 +326,30 @@ class CubeVision:
         return self._pixel_pose(candidate['center'], z, header, 'RGB pose')
 
     def _candidate_pose(self, candidate, header):
-        z = candidate['depth'] + self.surface_to_center_depth
-        return self._pixel_pose(candidate['center'], z, header, 'depth pose')
+        center = candidate['camera_center']
+        if center is None:
+            return None
+        point = PointStamped()
+        point.header = header
+        corrected = self.sensor_to_optical.dot(np.asarray(center, dtype=np.float64))
+        point.point.x = float(corrected[0])
+        point.point.y = float(corrected[1])
+        point.point.z = float(corrected[2])
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.output_frame, header.frame_id, header.stamp,
+                rospy.Duration(0.08))
+            transformed = tf2_geometry_msgs.do_transform_point(point, transform)
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as exc:
+            rospy.logwarn_throttle(
+                2.0, 'cube_vision depth pose TF unavailable: %s', exc)
+            return None
+        pose = PoseStamped()
+        pose.header = transformed.header
+        pose.pose.position = transformed.point
+        pose.pose.orientation.w = 1.0
+        return pose
 
     def _pixel_pose(self, center, z, header, label):
         u, v = center
@@ -276,9 +360,11 @@ class CubeVision:
             return None
         point = PointStamped()
         point.header = header
-        point.point.x = float(ray[0] * z / ray[2])
-        point.point.y = float(ray[1] * z / ray[2])
-        point.point.z = float(z)
+        corrected = self.sensor_to_optical.dot(np.asarray(
+            [ray[0] * z / ray[2], ray[1] * z / ray[2], z], dtype=np.float64))
+        point.point.x = float(corrected[0])
+        point.point.y = float(corrected[1])
+        point.point.z = float(corrected[2])
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.output_frame, header.frame_id, header.stamp,

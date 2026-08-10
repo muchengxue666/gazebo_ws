@@ -322,9 +322,105 @@ class CubeVisionCore:
 
     @staticmethod
     def inset_mask(candidate, scale=0.82):
-        hull = candidate['hull']
-        center = candidate['center']
-        inset = center + float(scale) * (hull - center)
+        polygon = (candidate['face_quad']
+                   if candidate.get('face_quad') is not None
+                   else candidate['hull'])
+        center = np.mean(polygon, axis=0)
+        inset = center + float(scale) * (polygon - center)
         mask = np.zeros(candidate['mask'].shape, dtype=np.uint8)
         cv2.fillConvexPoly(mask, np.round(inset).astype(np.int32), 255)
         return mask
+
+    @staticmethod
+    def estimate_cube_center(depth, mask, camera_matrix, half_size,
+                             min_depth, max_depth, min_points=30,
+                             max_residual=0.004):
+        depth = np.asarray(depth)
+        # Some Gazebo/CvBridge combinations expose a single-channel depth
+        # image as HxWx1. Normalize it before advanced pixel indexing; a
+        # multi-channel depth image is not valid input for this geometry.
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth = depth[:, :, 0]
+        if depth.ndim != 2 or mask.ndim != 2 or depth.shape != mask.shape:
+            return None
+        rows, cols = np.nonzero(mask > 0)
+        values = depth[rows, cols].astype(np.float64)
+        valid = (np.isfinite(values)
+                 & (values >= float(min_depth))
+                 & (values <= float(max_depth)))
+        rows = rows[valid]
+        cols = cols[valid]
+        values = values[valid]
+        if values.size < int(min_points):
+            return None
+
+        median = float(np.median(values))
+        depth_band = max(0.015, 4.0 * float(max_residual))
+        near_surface = np.abs(values - median) <= depth_band
+        rows = rows[near_surface]
+        cols = cols[near_surface]
+        values = values[near_surface]
+        if values.size < int(min_points):
+            return None
+
+        fx = float(camera_matrix[0, 0])
+        fy = float(camera_matrix[1, 1])
+        cx = float(camera_matrix[0, 2])
+        cy = float(camera_matrix[1, 2])
+        points = np.column_stack((
+            (cols.astype(np.float64) - cx) * values / fx,
+            (rows.astype(np.float64) - cy) * values / fy,
+            values,
+        ))
+
+        inliers = np.ones(points.shape[0], dtype=bool)
+        normal = None
+        surface_origin = None
+        for _ in range(3):
+            selected = points[inliers]
+            if selected.shape[0] < int(min_points):
+                return None
+            surface_origin = np.median(selected, axis=0)
+            _, _, axes = np.linalg.svd(selected - surface_origin,
+                                       full_matrices=False)
+            normal = axes[-1]
+            residuals = np.abs((points - surface_origin).dot(normal))
+            next_inliers = residuals <= float(max_residual)
+            if np.array_equal(next_inliers, inliers):
+                break
+            inliers = next_inliers
+
+        if normal is None or np.count_nonzero(inliers) < int(min_points):
+            return None
+        selected = points[inliers]
+        surface_origin = np.mean(selected, axis=0)
+        residual_rms = float(np.sqrt(np.mean(
+            np.square((selected - surface_origin).dot(normal)))))
+        if residual_rms > float(max_residual):
+            return None
+
+        ray = np.array([
+            (float(np.mean(cols[inliers])) - cx) / fx,
+            (float(np.mean(rows[inliers])) - cy) / fy,
+            1.0,
+        ], dtype=np.float64)
+        denominator = float(np.dot(normal, ray))
+        if abs(denominator) < 0.15:
+            return None
+        distance = float(np.dot(normal, surface_origin) / denominator)
+        if distance <= 0.0:
+            return None
+        surface = distance * ray
+
+        # The outward normal of a visible face points toward the camera.
+        if np.dot(normal, -surface) < 0.0:
+            normal = -normal
+        center = surface - float(half_size) * normal
+        return {
+            'center': center,
+            'surface': surface,
+            'normal': normal,
+            'depth': float(surface[2]),
+            'valid_points': int(np.count_nonzero(inliers)),
+            'residual_rms': residual_rms,
+        }
