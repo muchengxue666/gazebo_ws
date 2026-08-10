@@ -34,18 +34,19 @@ arm_poses:
   navigation:
     positions: [0.0, 1.6, -2.2, -1.0, 0.0]
     duration: 3.0
+  # Captured from the verified search-camera snapshot.
   observe:
-    positions: [0.001026, 1.005277, 0.753804, 1.381747, 0.188403]
+    positions: [1.570006, 0.765642, 0.815474, 0.941225, 0.000000]
     duration: 3.0
   grasp:
-    positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.004899]
+    positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.000000]
     duration: 3.0
   # Keep the object attached in this raised posture while navigating.
   transport:
     positions: [0.0, 1.6, -2.2, -1.0, 0.0]
     duration: 3.0
   place:
-    positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.004899]
+    positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.000000]
     duration: 3.0
 
 gripper_open: 1.5
@@ -69,10 +70,18 @@ max_align_iterations: 6
 max_align_step: 0.15
 align_xy_tolerance: 0.012
 align_z_tolerance: 0.03
-search_standoff: 0.35
-search_angles: [0.0, 1.5708, -1.5708, 3.14159]
-# Small in-place heading adjustments at the same observation point.
-search_heading_offsets: [0.35, -0.35]
+# Fixed map pose captured from the successful search-camera setup.
+search_pose: {x: -1.4135, y: -0.4311, yaw: 1.7201}
+# Experimental direct rotation while observe is active. This bypasses
+# move_base collision checking because the lowered arm blocks raw /scan.
+search_settle_time: 0.5
+search_rotation_speed: -0.20
+search_rotation_angle: 6.283185
+search_rotation_timeout: 40.0
+search_rotation_rate: 20.0
+search_rotation_max_drift: 0.08
+# Spatial tolerance used to avoid stopping repeatedly on one non-target cube.
+search_detection_dedupe_distance: 0.05
 drop_margin: 0.05
 drop_settle_samples: 5
 drop_settle_delta: 0.01

@@ -1,52 +1,112 @@
-# Gazebo Navigation Handoff
+# Gazebo 导航与抓取任务交接文档
 
-## Scope
+## 1. 项目范围与当前状态
 
-This document covers the completed navigation stack. Pick/place manipulation is still experimental and is not part of the navigation baseline.
+任务目标是让小车在 Gazebo 中自主导航到物块搜索区域，停车后由机械臂下压相机观察并抓取物块，随后抬臂运输到对应投放区域。
 
-Do not modify these files while continuing navigation work:
+当前状态：
 
-- `src/car3/world/math.world`
-- `src/car3/scripts/spawn_cubes.py`
+- 静态地图导航主链已完成并验证；
+- 自动任务已经能够成功导航到修正后的第一个搜索观察点；
+- `observe` 姿态下机械臂会进入激光雷达扫描平面，已实测无法正常使用 `move_base` 导航；
+- 当前新增受控实验：到固定搜索位姿后，observe 下仅发布零线速度和限速角速度旋转一周；该实验绕过局部规划器碰撞检查，尚未完成 Gazebo 实测；
+- 视觉检测、抓取、运输和释放尚未完成端到端验证；
+- 当前第一阶段只处理单个 `food -> cube_0` 物块；
+- daily 投放区域尚未确认，不能直接启用。
 
-The current `spawn_cubes.py` checksum is:
+必须保持不变的规则或既有实验文件：
 
 ```text
-27c21cf4f31f3dad34176962abdb16d5be02122455e60e9d8320880a29780c92
+src/car3/world/math.world
+src/car3/scripts/spawn_cubes.py
+src/car3/scripts/cube_vision.py
+src/car3/scripts/grasp_attach.py
 ```
 
-## Canonical Navigation Entry
+其中 `math.world` 和 `spawn_cubes.py` 是规则性文件；其余文件属于既有抓取实验，不是已完成导航主链，也不作为当前新任务入口。
 
-Use this launch file for the completed navigation task:
+严禁使用旧入口：
+
+```text
+src/gazebo_nav/launch/gazebo_nav.launch
+```
+
+---
+
+## 2. 已验证的导航基线
+
+标准导航入口：
 
 ```text
 src/gazebo_nav/launch/static_nav_sim.launch
 ```
 
-It starts:
-
-- Gazebo and the car through `gazebo_map/launch/slam_sim.launch`
-- `map_server`
-- AMCL by default
-- `move_base`
-- RViz when enabled
-- optional random cubes and cones
-
-The current default map is:
+默认地图：
 
 ```text
 src/gazebo_map/map/ros_map_thin/ros_map_world_collision.yaml
 ```
 
-The navigation parameters are loaded from:
+主要配置：
 
 ```text
 src/gazebo_nav/launch/config/static_nav/move_base.yaml
+src/gazebo_nav/launch/config/static_nav/amcl.yaml
+src/gazebo_nav/launch/config/static_nav/teb_local_planner_params.yaml
+src/gazebo_nav/rviz/static_nav.rviz
 ```
 
-## Required Environment
+导航主链保持：
 
-Source the workspaces in this order:
+- `map_server` 发布静态地图；
+- AMCL 使用原始 `/scan` 定位；
+- `move_base` 使用 `global_planner/GlobalPlanner`；
+- `GlobalPlanner/use_dijkstra: true`；
+- Global Costmap 包含 static、`/scan` obstacle 和 inflation 三层；
+- Local Costmap 使用滚动窗口和 `/scan` 动态障碍；
+- 默认局部规划器为 `teb_local_planner/TebLocalPlannerROS`；
+- TEB 同伦类规划默认关闭。
+
+导航数据流：
+
+```text
+地图 YAML/PGM
+  -> map_server
+  -> /map
+
+/map + /scan
+  -> global_costmap
+  -> GlobalPlanner（Dijkstra）
+  -> /move_base/GlobalPlanner/plan
+
+/scan
+  -> local_costmap obstacle_layer
+  -> TEB
+  -> /cmd_vel
+```
+
+当前 TEB 相关参数包括：
+
+```yaml
+max_global_plan_lookahead_dist: 1.0
+min_obstacle_dist: 0.08
+inflation_dist: 0.15
+max_vel_x: 0.35
+max_vel_y: 0.35
+max_vel_trans: 0.35
+max_vel_theta: 0.80
+no_inner_iterations: 2
+no_outer_iterations: 2
+enable_homotopy_class_planning: false
+```
+
+底盘使用 Gazebo planar controller，已手动验证 `/cmd_vel.linear.y` 横向移动有效。提高 `max_vel_y` 只表示允许更高横向速度，并不会强制 TEB 优先横移；该问题当前暂缓，不继续修改已验证导航主链。
+
+---
+
+## 3. 环境与基础启动命令
+
+建议按以下顺序加载环境：
 
 ```bash
 source /opt/ros/noetic/setup.bash
@@ -54,104 +114,332 @@ source /home/mcx/gazebo_ws/devel/setup.bash
 source /home/mcx/catkin_ws/devel/setup.bash
 ```
 
-The last source is important because `catkin_ws` provides the navigation and controller packages used by the launch files.
-
-## Recommended Commands
-
-### Static navigation baseline
-
-Use this to test the static map and walls without random objects:
+只启动静态导航基线：
 
 ```bash
-roslaunch gazebo_nav static_nav_sim.launch gui:=true rviz:=true use_teb:=true teb_homotopy:=false spawn_dynamic_objects:=false
+roslaunch gazebo_nav static_nav_sim.launch \
+  gui:=true \
+  rviz:=true \
+  use_teb:=true \
+  teb_homotopy:=false \
+  spawn_dynamic_objects:=false
 ```
 
-### Current navigation with random dynamic objects
-
-Use this to test the current dynamic-obstacle configuration:
+启动包含随机物块和锥桶的导航环境：
 
 ```bash
-roslaunch gazebo_nav static_nav_sim.launch gui:=true rviz:=true use_teb:=true teb_homotopy:=false spawn_dynamic_objects:=true
+roslaunch gazebo_nav static_nav_sim.launch \
+  gui:=true \
+  rviz:=true \
+  use_teb:=true \
+  teb_homotopy:=false \
+  spawn_dynamic_objects:=true
 ```
 
-`spawn_dynamic_objects:=true` starts the existing `spawn_cubes.py` node. It generates random cubes and cones. Do not use cube positions from one run as fixed positions for another run.
+`spawn_dynamic_objects:=true` 会运行既有 `spawn_cubes.py`。物块位置每次随机生成，不能把某次运行中的物块坐标写死到任务代码中。
 
-## Navigation Data Flow
+---
+
+## 4. 当前自动任务入口
+
+当前新任务入口：
 
 ```text
-math.world
-  -> Gazebo walls and robot
-
-map YAML and PGM
-  -> map_server
-  -> /map
-
-/map + /scan
-  -> global_costmap
-  -> GlobalPlanner
-  -> /move_base/GlobalPlanner/plan
-
-/scan
-  -> local_costmap obstacle_layer
-  -> TEB local planner
-  -> /cmd_vel
+src/car3/launch/nav_pick_place_task.launch
 ```
 
-The current global costmap includes:
+该 launch 会并发请求启动：
+
+1. `gazebo_nav/launch/static_nav_sim.launch`；
+2. 既有视觉节点 `cube_vision.py`；
+3. 新任务执行器 `pick_place_executor.py`。
+
+注意：launch 文件中的书写顺序不代表导航栈完全启动后才启动执行器。Gazebo、控制器、AMCL、move_base、视觉和执行器会并发初始化，因此执行器内部仍包含 action server 和导航数据等待。
+
+完整启动命令：
+
+```bash
+source /home/mcx/gazebo_ws/devel/setup.bash
+
+roslaunch car3 nav_pick_place_task.launch \
+  gui:=true \
+  rviz:=true \
+  spawn_dynamic_objects:=true \
+  target_category:=food \
+  start_task:=true \
+  arm_poses_verified:=true
+```
+
+关键参数：
+
+```text
+start_task=true            启动自动状态机
+arm_poses_verified=true    允许执行机械臂姿态；仅表示人工确认后放行
+target_category=food       第一阶段目标类别
+```
+
+夹爪参数：
+
+```text
+完全张开：1.5
+抓取闭合：0.8
+gripper_close_threshold：0.81
+```
+
+`0.81` 用于兼容 `grasp_attach.py` 中严格小于阈值的判断，使 `0.8` 能触发仿真附着。
+
+---
+
+## 5. 自动导航调试结论
+
+### 5.1 最小 action 测试脚本
+
+新增脚本：
+
+```text
+src/car3/scripts/test_move_base_goal.py
+```
+
+它只执行：
+
+```text
+等待 /move_base action server
+-> 等待 startup_delay
+-> 发送一个 map 坐标目标
+-> 输出成功、失败或超时
+```
+
+不启动视觉、不控制机械臂、不控制夹爪、不清理 costmap、不自动重试。
+
+示例：
+
+```bash
+rosrun car3 test_move_base_goal.py \
+  _x:=-1.66 \
+  _y:=-0.445 \
+  _yaw:=0.0 \
+  _startup_delay:=10.0 \
+  _timeout:=60.0
+```
+
+该目标已实测导航成功，证明：
+
+- `/move_base` action 接口正常；
+- GlobalPlanner、TEB、地图与 costmap 主链正常；
+- 完整任务早期失败并不是 action 接口本身造成的。
+
+### 5.2 原始首个搜索点错误
+
+物块生成区域 `area_a`：
+
+```yaml
+x_min: -2.10
+x_max: -1.92
+y_min: -0.61
+y_max: -0.28
+```
+
+区域中心约为：
+
+```text
+(-2.01, -0.445)
+```
+
+最初使用：
+
+```text
+search_standoff = 0.35
+search angle = 0
+```
+
+生成了错误的首个观察目标：
+
+```text
+(-2.36, -0.445, yaw=0)
+```
+
+该点经独立脚本测试失败，原因是目标过于靠近地图左侧墙体/边界。问题不是“目标发送太早”，而是把物块生成区域机械地转换成了不安全的导航观察点。
+
+### 5.3 当前固定搜索位姿
+
+通过 Gazebo/TF 状态快照记录了当前固定搜索位姿：
+
+```yaml
+search_pose: {x: -1.4135, y: -0.4311, yaw: 1.7201}
+```
+
+执行器不再根据 `search_areas`、`search_standoff` 和 `search_angles` 自动生成小车观察导航点。`search_areas` 仅保留为物块随机生成范围说明。
+
+重要概念：
+
+```text
+search_areas = 物块可能随机生成的区域
+```
+
+不等于：
+
+```text
+安全的小车观察导航点
+```
+
+小车先通过 `/move_base` action 导航到固定搜索位姿，然后停车并进入新的 observe 探测姿态。
+
+---
+
+## 6. 机械臂姿态与激光雷达结论
+
+当前任务姿态配置：
+
+```yaml
+navigation: [0.0, 1.6, -2.2, -1.0, 0.0]
+observe:    [1.570006, 0.765642, 0.815474, 0.941225, -0.000161]
+grasp:      [0.000288, 1.570820, 0.126232, 1.570326, 0.004899]
+transport:  [0.0, 1.6, -2.2, -1.0, 0.0]
+place:      [0.000288, 1.570820, 0.126232, 1.570326, 0.004899]
+```
+
+实测结论：
+
+- 模型默认姿态可以导航；
+- `navigation` 姿态可以导航；
+- `observe` 姿态无法正常使用 `move_base` 导航；
+- 原因是下压机械臂进入水平激光扫描平面，被原始 `/scan` 识别为自体障碍；
+- 当前按实验要求增加 observe 下直接旋转：仅发布 `linear.x=0`、`linear.y=0`、`angular.z=0.20`，最多旋转一周，超时/漂移/检测后立即归零；
+- 该直接 `/cmd_vel` 旋转绕过 move_base 碰撞检查，可能影响原始 `/scan`、AMCL 和 costmap，必须仅用于受控实验；
+- `transport` 当前与 `navigation` 使用相同关节值，设计目标是在抬臂状态下运输。
+
+因此必须遵守：
+
+```text
+navigation/默认安全姿态：允许 move_base 导航
+固定搜索位姿：(-1.4135, -0.4311, yaw=1.7201)
+observe：先停车、再下压；当前受控实验允许直接原地旋转一周
+observe 旋转：linear.x=0、linear.y=0、angular.z=0.20，最终必须归零
+抓取前若需移动：先抬回 navigation，再移动
+抓取后：先抬到 transport，再导航运输
+grasp/place：小车完全停止
+```
+
+第一阶段不实现 `/scan_filtered`，AMCL 和 move_base 继续使用已经验证的原始 `/scan`。
+
+---
+
+## 7. 当前任务执行顺序
+
+当前期望状态机：
+
+```text
+INIT_VALIDATE
+-> 等待 move_base action server
+-> 等待机械臂 action server
+-> 等待 joint_states
+-> RESET_GRIPPER
+-> 首次粗导航保持模型默认机械臂姿态
+-> WAIT_NAVIGATION_READY
+-> 等待 10 秒启动缓冲并确认 map/scan/TF
+-> SEARCH_SOURCE
+-> 通过 /move_base action 导航到 (-1.4135, -0.4311, yaw=1.7201)
+-> 停车并等待稳定
+-> observe 下压
+-> 以 linear.x/y=0、angular.z=-0.20 顺时针直接旋转，最多一周
+-> 看到任意已知方块后立即停车并确认类别
+-> 非目标类别按 map 位置记录并继续剩余旋转
+-> 目标类别确认后发布 detected_category 并进入后续流程
+-> 检测到目标或旋转完成后发布零速度
+-> 检测到目标后进行机械臂几何测量与视觉对位
+-> grasp
+-> transport
+-> 导航到投放区域
+-> place/release
+-> SUCCESS
+```
+
+当前已确认到：
+
+```text
+SEARCH_SOURCE -> (-1.66, -0.445, pi) 粗导航成功
+```
+
+当前固定搜索位姿和 observe 下直接旋转逻辑已经写入代码，但尚未完成新的 Gazebo 旋转/视觉实测。后续视觉、对位、抓取、运输与释放仍需逐阶段验证。
+
+---
+
+## 8. 常用运行检查
+
+检查节点：
+
+```bash
+rosnode list
+```
+
+导航基线应包含：
+
+```text
+/gazebo
+/map_server
+/amcl
+/move_base
+/robot_state_publisher
+```
+
+完整任务还应包含：
+
+```text
+/cube_vision
+/pick_place_executor
+```
+
+检查规划器：
+
+```bash
+rosparam get /move_base/base_global_planner
+rosparam get /move_base/base_local_planner
+```
+
+预期：
+
+```text
+global_planner/GlobalPlanner
+teb_local_planner/TebLocalPlannerROS
+```
+
+检查全局 costmap 插件：
+
+```bash
+rosparam get /move_base/global_costmap/plugins
+```
+
+预期包括：
 
 ```text
 static_layer
-obstacle_layer from /scan
+obstacle_layer
 inflation_layer
 ```
 
-This means cones and other laser-visible objects are included in global replanning. The planner frequency is currently `1.0 Hz`.
-
-The local costmap remains a rolling `2.5 m x 2.5 m` map with `/scan` obstacle marking and inflation.
-
-## Current Planner Configuration
-
-Global planner:
-
-```yaml
-base_global_planner: global_planner/GlobalPlanner
-GlobalPlanner/cost_factor: 0.5
-GlobalPlanner/use_dijkstra: true
-GlobalPlanner/use_quadratic: true
-GlobalPlanner/use_grid_path: false
-```
-
-TEB is enabled at launch with:
-
-```text
-use_teb:=true
-```
-
-Current relevant TEB settings:
-
-```yaml
-max_global_plan_lookahead_dist: 1.0
-min_obstacle_dist: 0.08
-inflation_dist: 0.15
-max_vel_x: 0.35
-max_vel_y: 0.05
-max_vel_theta: 0.80
-no_inner_iterations: 2
-no_outer_iterations: 2
-enable_homotopy_class_planning: false
-```
-
-To test homotopy as an isolated comparison, change only the launch argument:
+检查任务状态：
 
 ```bash
-roslaunch gazebo_nav static_nav_sim.launch use_teb:=true teb_homotopy:=true spawn_dynamic_objects:=true
+rostopic echo /pick_place_executor/state
 ```
 
-Do not mix this navigation A/B test with manipulation changes.
+检查导航 action：
 
-## RViz Topics
+```bash
+rostopic echo /move_base/status
+rostopic echo /move_base/goal
+rostopic echo /move_base/result
+```
 
-Useful RViz displays:
+检查定位和激光：
+
+```bash
+rostopic echo /amcl_pose
+rostopic hz /scan
+rosrun tf tf_echo map base_footprint
+```
+
+RViz 建议显示：
 
 ```text
 /map
@@ -164,146 +452,57 @@ TEB Local Plan: /move_base/TebLocalPlannerROS/local_plan
 RobotModel
 ```
 
-Send a goal using RViz `2D Nav Goal`. The goal frame should be `map`.
+---
 
-## Runtime Checks
+## 9. 已知限制与后续工作
 
-Check the active nodes:
+下一阶段应按以下顺序继续，不要同时修改导航和抓取：
 
-```bash
-rosnode list
-```
+1. 在第一个观察点停车后验证 `observe` 相机画面；
+2. 检查 `/cube_vision/category`、`confidence` 和 `pose`；
+3. 判断单个 180° 观察 waypoint 是否覆盖整个 `area_a`；
+4. 如覆盖不足，只增加经过实际导航和视野验证的安全观察 waypoint；
+5. 验证视觉目标到 `map`、`base_footprint` 的 TF；
+6. 验证车体对位前先抬回 `navigation`；
+7. 验证 `grasp_attach/ready`、夹爪 `0.8` 和 `attached_model=cube_0`；
+8. 验证抓取后切换 `transport` 时物块不丢失；
+9. 验证原始 `/scan` 下运输导航；
+10. 验证 food 投放区域释放和 Gazebo 模型位置稳定性；
+11. 最后再确认 daily 投放区域并扩展到三类物块。
 
-Expected navigation nodes include:
+当前不要做：
 
-```text
-/gazebo
-/map_server
-/amcl
-/move_base
-/robot_state_publisher
-```
+- 不使用旧 `gazebo_nav.launch`；
+- 不修改规则文件或既有抓取实验文件；
+- 不在 `observe/grasp/place` 姿态下调用正常 move_base 导航；
+- 不把某次随机物块坐标写死；
+- 不声称已支持任意末端目标 IK；
+- 不在视觉与抓取尚未验证前扩展三物块完整流程；
+- 不把 TEB 横向移动偏好调试与抓取调试混在同一轮修改中。
 
-Check the active planner:
+---
 
-```bash
-rosparam get /move_base/base_global_planner
-rosparam get /move_base/base_local_planner
-```
+## 10. 当前交接验收状态
 
-With TEB enabled, expected output includes:
+已完成：
 
-```text
-global_planner/GlobalPlanner
-teb_local_planner/TebLocalPlannerROS
-```
+- 标准导航入口、地图、Dijkstra、Global Costmap `/scan` 和 TEB 基线；
+- RViz 手动导航；
+- `/move_base` action 最小脚本导航；
+- 自动任务修正首个搜索目标后的粗导航；
+- 默认姿态与 `navigation` 姿态导航验证；
+- `observe` 姿态不可使用 `move_base` 导航的实测确认；
+- 固定搜索位姿和快照 observe 五关节值已记录；
+- arm-down 直接限速旋转扫描逻辑已实现（尚待 Gazebo 实测）；
+- arm-down 停车、抬臂后导航的任务约束。
 
-Check the global costmap plugins:
+尚未完成：
 
-```bash
-rosparam get /move_base/global_costmap/plugins
-```
-
-Expected plugins are:
-
-```text
-static_layer
-obstacle_layer
-inflation_layer
-```
-
-Check navigation action state:
-
-```bash
-rostopic echo /move_base/status
-```
-
-Check robot localization:
-
-```bash
-rostopic echo /amcl_pose
-```
-
-## Important Launch Distinction
-
-The following file is **not** the canonical static navigation entry:
-
-```text
-src/gazebo_nav/launch/gazebo_nav.launch
-```
-
-It is an older/alternative launch file. It:
-
-- hard-codes `math.yaml`
-- uses a different parameter directory
-- uses DWA directly
-- expects a different RViz path
-- should not be used to reproduce the current static navigation result
-
-Use `static_nav_sim.launch` instead.
-
-## Files Used by Completed Navigation
-
-Primary launch files:
-
-```text
-src/gazebo_nav/launch/static_nav_sim.launch
-src/gazebo_map/launch/slam_sim.launch
-```
-
-Navigation configuration:
-
-```text
-src/gazebo_nav/launch/config/static_nav/move_base.yaml
-src/gazebo_nav/launch/config/static_nav/amcl.yaml
-src/gazebo_nav/launch/config/static_nav/teb_local_planner_params.yaml
-src/gazebo_nav/rviz/static_nav.rviz
-```
-
-Map files:
-
-```text
-src/gazebo_map/map/ros_map_thin/ros_map_world_collision.yaml
-src/gazebo_map/map/ros_map_thin/ros_map_world_collision.pgm
-```
-
-The actual PGM name should always be checked from the selected map YAML before changing maps.
-
-## Files That Are Not Needed for Navigation Handoff
-
-These files belong to object generation, perception, or manipulation experiments:
-
-```text
-src/car3/scripts/spawn_cubes.py
-src/car3/scripts/cube_vision.py
-src/car3/scripts/grasp_attach.py
-src/car3/scripts/test_observe_grasp.py
-src/car3/scripts/gripper_mimic.py
-src/car3/config/pick_place_task.yaml
-src/car3/launch/pick_place_task.launch
-```
-
-Their roles are:
-
-- `spawn_cubes.py`: random cube and cone generation; immutable for this project
-- `cube_vision.py`: RGB/template recognition and experimental pose output
-- `grasp_attach.py`: Gazebo grasp simulation and attachment status
-- `test_observe_grasp.py`: experimental observe-to-grasp test only
-- `gripper_mimic.py`: publishes complete mimic joint states
-- `pick_place_task.launch`: navigation plus perception/manipulation experiment entry; not the navigation baseline
-
-Do not include `test_observe_grasp.py` in a navigation-only handoff or use it as a navigation health check.
-
-## Navigation Handoff Acceptance
-
-A navigation-only handoff is complete when:
-
-1. `static_nav_sim.launch` starts with the required workspace overlay order.
-2. AMCL publishes a valid pose.
-3. `move_base` uses GlobalPlanner and the intended TEB/DWA local planner.
-4. RViz displays global and local costmaps.
-5. A normal RViz goal reaches its target.
-6. With dynamic objects enabled, laser-visible cones appear in the configured costmaps and the global plan can be replanned around them.
-7. No changes are made to `math.world` or `spawn_cubes.py`.
-
-Manipulation work should start only after this baseline has been reproduced independently.
+- 观察点相机视野覆盖验证；
+- 视觉稳定识别；
+- 视觉闭环对位；
+- 单物块抓取附着；
+- 抬臂运输；
+- 投放与释放验证；
+- daily 区域确认；
+- 三类物块完整闭环。

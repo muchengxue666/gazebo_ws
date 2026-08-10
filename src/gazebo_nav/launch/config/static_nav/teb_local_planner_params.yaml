@@ -16,7 +16,7 @@ TebLocalPlannerROS:
   min_resolution_collision_check_angular: 0.10
 
   max_vel_x: 0.35
-  max_vel_x_backwards: 0.01
+  max_vel_x_backwards: 0.2
   max_vel_y: 0.05
   max_vel_trans: 0.35
   max_vel_theta: 0.80

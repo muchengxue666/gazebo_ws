@@ -18,10 +18,10 @@ from geometry_msgs.msg import (
     PointStamped,
     PoseWithCovarianceStamped,
     PoseStamped,
+    Twist,
 )
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from nav_msgs.msg import OccupancyGrid
-from nav_msgs.srv import GetPlan
 from sensor_msgs.msg import JointState, LaserScan
 from std_msgs.msg import Bool, Float32, Float64, String
 from std_srvs.srv import Empty
@@ -37,7 +37,6 @@ class PickPlaceExecutor:
     def __init__(self):
         self.target_category = rospy.get_param('~target_category', 'food').lower()
         self.category_to_model = rospy.get_param('~category_to_model', {})
-        self.search_areas = rospy.get_param('~search_areas', {})
         self.drop_areas = rospy.get_param('~drop_areas', {})
         self.map_bounds = rospy.get_param('~map_bounds', {})
         self.arm_poses = rospy.get_param('~arm_poses', {})
@@ -72,12 +71,19 @@ class PickPlaceExecutor:
             rospy.get_param('~align_xy_tolerance', 0.012))
         self.align_z_tolerance = float(
             rospy.get_param('~align_z_tolerance', 0.03))
-        self.search_standoff = float(
-            rospy.get_param('~search_standoff', 0.35))
-        self.search_angles = [float(value) for value in rospy.get_param(
-            '~search_angles', [0.0, 1.5708, -1.5708, 3.14159])]
-        self.search_heading_offsets = [float(value) for value in rospy.get_param(
-            '~search_heading_offsets', [0.35, -0.35])]
+        self.search_pose = rospy.get_param('~search_pose', {})
+        self.search_rotation_speed = float(
+            rospy.get_param('~search_rotation_speed', 0.20))
+        self.search_rotation_angle = float(
+            rospy.get_param('~search_rotation_angle', 2.0 * math.pi))
+        self.search_rotation_timeout = float(
+            rospy.get_param('~search_rotation_timeout', 40.0))
+        self.search_rotation_rate = float(
+            rospy.get_param('~search_rotation_rate', 20.0))
+        self.search_rotation_max_drift = float(
+            rospy.get_param('~search_rotation_max_drift', 0.08))
+        self.search_settle_time = float(
+            rospy.get_param('~search_settle_time', 0.5))
         self.drop_margin = float(rospy.get_param('~drop_margin', 0.05))
         self.drop_settle_samples = int(
             rospy.get_param('~drop_settle_samples', 5))
@@ -113,7 +119,12 @@ class PickPlaceExecutor:
         self.category = 'unknown'
         self.confidence = 0.0
         self.vision_pose = None
+        self.vision_pose_category = 'unknown'
+        self.vision_pose_confidence = 0.0
         self.vision_pose_received = rospy.Time(0)
+        self.seen_non_target_cubes = []
+        self.search_detection_dedupe_distance = float(
+            rospy.get_param('~search_detection_dedupe_distance', 0.05))
         self.ready = False
         self.grasp_state = 'IDLE'
         self.attached_model = ''
@@ -131,7 +142,6 @@ class PickPlaceExecutor:
             FollowJointTrajectoryAction)
         self.clear_costmaps = rospy.ServiceProxy(
             '/move_base/clear_costmaps', Empty)
-        self.make_plan = rospy.ServiceProxy('/move_base/make_plan', GetPlan)
         self.get_model_state = rospy.ServiceProxy(
             '/gazebo/get_model_state', GetModelState)
 
@@ -141,6 +151,9 @@ class PickPlaceExecutor:
             '~state', String, queue_size=1, latch=True)
         self.result_pub = rospy.Publisher(
             '~result', String, queue_size=1, latch=True)
+        self.detected_category_pub = rospy.Publisher(
+            '~detected_category', String, queue_size=1, latch=True)
+        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
 
         rospy.Subscriber('/joint_states', JointState, self._joint_cb)
         self._readiness_subscribers.extend([
@@ -173,8 +186,34 @@ class PickPlaceExecutor:
         if self.target_category not in self.drop_areas:
             raise rospy.ROSInitException(
                 'target_category has no drop area: ' + self.target_category)
-        if not self.search_areas:
-            raise rospy.ROSInitException('search_areas is empty')
+        required_pose = ('x', 'y', 'yaw')
+        if (not isinstance(self.search_pose, dict)
+                or any(key not in self.search_pose for key in required_pose)):
+            raise rospy.ROSInitException('search_pose is incomplete')
+        if not all(math.isfinite(float(self.search_pose[key]))
+                   for key in required_pose):
+            raise rospy.ROSInitException('search_pose contains invalid values')
+        if not self._inside_map(
+                float(self.search_pose['x']), float(self.search_pose['y'])):
+            raise rospy.ROSInitException('search_pose is outside map bounds')
+        if (not math.isfinite(self.search_rotation_speed)
+                or self.search_rotation_speed == 0.0):
+            raise rospy.ROSInitException(
+                'search_rotation_speed must be finite and nonzero')
+        for name, value in (
+                ('search_rotation_angle', self.search_rotation_angle),
+                ('search_rotation_timeout', self.search_rotation_timeout),
+                ('search_rotation_rate', self.search_rotation_rate),
+                ('search_rotation_max_drift', self.search_rotation_max_drift)):
+            if not math.isfinite(value) or value <= 0.0:
+                raise rospy.ROSInitException(name + ' must be positive')
+        if (not math.isfinite(self.search_detection_dedupe_distance)
+                or self.search_detection_dedupe_distance <= 0.0):
+            raise rospy.ROSInitException(
+                'search_detection_dedupe_distance must be positive')
+        if self.search_rotation_angle > 2.0 * math.pi + 0.01:
+            raise rospy.ROSInitException(
+                'search_rotation_angle must not exceed one revolution')
         for name in ('navigation', 'observe', 'grasp', 'transport', 'place'):
             self._read_arm_pose(name)
         for name, value in (
@@ -236,6 +275,10 @@ class PickPlaceExecutor:
 
     def _vision_pose_cb(self, msg):
         self.vision_pose = msg
+        # cube_vision publishes category/confidence immediately before pose;
+        # retain that association so stale metadata cannot label a new pose.
+        self.vision_pose_category = self.category
+        self.vision_pose_confidence = self.confidence
         self.vision_pose_received = rospy.Time.now()
 
     def _ready_cb(self, msg):
@@ -251,7 +294,11 @@ class PickPlaceExecutor:
         rospy.loginfo('pick_place state: %s', state)
         self.state_pub.publish(String(data=state))
 
+    def _stop_base(self):
+        self.cmd_vel_pub.publish(Twist())
+
     def _cancel_actions(self):
+        self._stop_base()
         self.nav_client.cancel_all_goals()
         self.arm_client.cancel_all_goals()
 
@@ -462,24 +509,55 @@ class PickPlaceExecutor:
               + self.place_tcp_in_base))
         self._move_arm('navigation')
 
+    def _current_known_detection(self, since_received=None):
+        pose = self.vision_pose
+        received = self.vision_pose_received
+        category = self.vision_pose_category
+        if (pose is None or category not in self.category_to_model
+                or category != self.category):
+            return None
+        stamp = pose.header.stamp
+        age = ((rospy.Time.now() - stamp).to_sec()
+               if stamp != rospy.Time(0) else 0.0)
+        received_after = since_received is None or received > since_received
+        stamp_is_usable = stamp == rospy.Time(0) or age >= 0.0
+        if (received_after and pose.header.frame_id and stamp_is_usable
+                and age <= self.max_pose_age
+                and self.vision_pose_confidence >= self.min_confidence):
+            return category, pose
+        return None
+
+    def _current_detection(self, since_received=None):
+        detection = self._current_known_detection(since_received)
+        if detection is not None and detection[0] == self.target_category:
+            return detection[1]
+        return None
+
+    def _is_seen_non_target(self, category, pose):
+        point = self._point_in_frame(pose, 'map').point
+        for seen_category, seen_x, seen_y in self.seen_non_target_cubes:
+            if (category == seen_category
+                    and math.hypot(point.x - seen_x, point.y - seen_y)
+                    <= self.search_detection_dedupe_distance):
+                return True
+        return False
+
+    def _record_non_target(self, category, pose):
+        point = self._point_in_frame(pose, 'map').point
+        self.seen_non_target_cubes.append((category, point.x, point.y))
+        self.detected_category_pub.publish(String(data=category))
+        rospy.loginfo(
+            'confirmed non-target cube: category=%s confidence=%.3f '
+            'map=(%.3f, %.3f)',
+            category, self.vision_pose_confidence, point.x, point.y)
+
     def _fresh_detection(self, since_received=None, timeout=None):
         timeout = self.detection_timeout if timeout is None else timeout
         deadline = rospy.Time.now() + rospy.Duration(timeout)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-            pose = self.vision_pose
-            received = self.vision_pose_received
-            if pose is not None and self.category == self.target_category:
-                stamp = pose.header.stamp
-                age = ((rospy.Time.now() - stamp).to_sec()
-                       if stamp != rospy.Time(0) else 0.0)
-                received_after = (since_received is None
-                                  or received > since_received)
-                stamp_is_usable = (stamp == rospy.Time(0)
-                                   or age >= 0.0)
-                if (received_after and pose.header.frame_id
-                        and stamp_is_usable and age <= self.max_pose_age
-                        and self.confidence >= self.min_confidence):
-                    return pose
+            pose = self._current_detection(since_received)
+            if pose is not None:
+                return pose
             rospy.sleep(0.05)
         return None
 
@@ -509,6 +587,19 @@ class PickPlaceExecutor:
         return (transform.transform.translation.x,
                 transform.transform.translation.y, yaw)
 
+    def _base_pose_odom(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'odom', 'base_footprint', rospy.Time(0), rospy.Duration(0.5))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as exc:
+            raise RuntimeError('odom to base TF unavailable: {}'.format(exc))
+        q = transform.transform.rotation
+        yaw = transformations.euler_from_quaternion(
+            [q.x, q.y, q.z, q.w])[2]
+        return (transform.transform.translation.x,
+                transform.transform.translation.y, yaw)
+
     def _inside_map(self, x, y, margin=0.0):
         margin = float(margin)
         return (float(self.map_bounds['x_min']) + margin <= x
@@ -530,52 +621,12 @@ class PickPlaceExecutor:
         goal.target_pose.pose.orientation.w = quaternion[3]
         return goal
 
-    def _wait_for_plan(self, x, y, yaw, timeout):
-        deadline = time.monotonic() + timeout
-        while not rospy.is_shutdown() and time.monotonic() < deadline:
-            try:
-                start_x, start_y, start_yaw = self._base_pose_map()
-                start = PoseStamped()
-                start.header.frame_id = 'map'
-                start.header.stamp = rospy.Time(0)
-                start.pose.position.x = start_x
-                start.pose.position.y = start_y
-                start_q = transformations.quaternion_from_euler(
-                    0.0, 0.0, start_yaw)
-                start.pose.orientation.x = start_q[0]
-                start.pose.orientation.y = start_q[1]
-                start.pose.orientation.z = start_q[2]
-                start.pose.orientation.w = start_q[3]
-                goal = PoseStamped()
-                goal.header.frame_id = 'map'
-                goal.header.stamp = rospy.Time(0)
-                goal.pose.position.x = x
-                goal.pose.position.y = y
-                goal_q = transformations.quaternion_from_euler(0.0, 0.0, yaw)
-                goal.pose.orientation.x = goal_q[0]
-                goal.pose.orientation.y = goal_q[1]
-                goal.pose.orientation.z = goal_q[2]
-                goal.pose.orientation.w = goal_q[3]
-                response = self.make_plan(start, goal, 0.0)
-                if response.plan.poses:
-                    return True
-            except (rospy.ServiceException, RuntimeError) as exc:
-                rospy.loginfo_throttle(
-                    5.0, 'waiting for move_base plan service/TF: %s', exc)
-            rospy.loginfo_throttle(
-                5.0, 'waiting for a non-empty move_base plan')
-            time.sleep(0.2)
-        return False
-
     def _navigate(self, x, y, yaw, label, retries=None):
         if not self._inside_map(x, y):
             rospy.logwarn('%s goal is outside map: (%.3f, %.3f)', label, x, y)
             return False
         retries = self.nav_retries if retries is None else retries
         for attempt in range(retries + 1):
-            if not self._wait_for_plan(x, y, yaw, self.nav_timeout):
-                rospy.logwarn('%s did not get a plan before timeout', label)
-                return False
             self.nav_client.send_goal(self._move_base_goal(x, y, yaw))
             deadline = time.monotonic() + self.nav_timeout
             while not rospy.is_shutdown() and time.monotonic() < deadline:
@@ -604,37 +655,79 @@ class PickPlaceExecutor:
 
     def _search(self):
         self._set_state('SEARCH_SOURCE')
-        # The first coarse goal uses the model's default arm posture. After an
-        # observation, every further base motion first restores navigation.
-        for area_name in sorted(self.search_areas):
-            area = self.search_areas[area_name]
-            center_x = 0.5 * (float(area['x_min']) + float(area['x_max']))
-            center_y = 0.5 * (float(area['y_min']) + float(area['y_max']))
-            for index, angle in enumerate(self.search_angles):
-                goal_x = center_x - self.search_standoff * math.cos(angle)
-                goal_y = center_y - self.search_standoff * math.sin(angle)
-                if not self._navigate(
-                        goal_x, goal_y, angle,
-                        '{} observation {}'.format(area_name, index), retries=0):
-                    continue
-                for heading_offset in [0.0] + self.search_heading_offsets:
-                    if heading_offset:
-                        self._move_arm('navigation')
-                        _, _, current_yaw = self._base_pose_map()
-                        if not self._navigate(
-                                goal_x, goal_y, current_yaw + heading_offset,
-                                '{} heading adjustment'.format(area_name),
-                                retries=0):
-                            continue
-                    self._move_arm('observe')
-                    since_received = self.vision_pose_received
-                    pose = self._fresh_detection(since_received)
-                    if pose is not None:
+        search_x = float(self.search_pose['x'])
+        search_y = float(self.search_pose['y'])
+        search_yaw = float(self.search_pose['yaw'])
+        if not self._navigate(
+                search_x, search_y, search_yaw, 'fixed search pose', retries=0):
+            raise RuntimeError('fixed search pose navigation failed')
+
+        self._stop_base()
+        time.sleep(self.search_settle_time)
+        self._move_arm('observe')
+        since_received = self.vision_pose_received
+        pose = self._current_detection(since_received)
+        if pose is not None:
+            return pose
+
+        self._set_state('ROTATE_SEARCH')
+        rospy.logwarn(
+            'rotating with observe arm down via direct /cmd_vel; '
+            'move_base collision checking is bypassed')
+        start_x, start_y, previous_yaw = self._base_pose_odom()
+        accumulated_yaw = 0.0
+        deadline = time.monotonic() + self.search_rotation_timeout
+        command = Twist()
+        command.angular.z = self.search_rotation_speed
+        period = 1.0 / self.search_rotation_rate
+        try:
+            while (not rospy.is_shutdown()
+                   and time.monotonic() < deadline
+                   and accumulated_yaw < self.search_rotation_angle):
+                current_x, current_y, current_yaw = self._base_pose_odom()
+                yaw_delta = math.atan2(
+                    math.sin(current_yaw - previous_yaw),
+                    math.cos(current_yaw - previous_yaw))
+                accumulated_yaw += abs(yaw_delta)
+                previous_yaw = current_yaw
+                drift = math.hypot(current_x - start_x, current_y - start_y)
+                if drift > self.search_rotation_max_drift:
+                    raise RuntimeError(
+                        'search rotation drift exceeded limit: {:.3f} m'.format(
+                            drift))
+
+                detection = self._current_known_detection(since_received)
+                if detection is not None:
+                    category, pose = detection
+                    if category == self.target_category:
+                        self._stop_base()
+                        self._set_state('CONFIRM_CUBE')
+                        self.detected_category_pub.publish(String(data=category))
                         rospy.loginfo(
-                            'found %s in %s', self.target_category, area_name)
+                            'confirmed target cube: category=%s '
+                            'confidence=%.3f after %.2f rad',
+                            category, self.vision_pose_confidence,
+                            accumulated_yaw)
                         return pose
-                    self._move_arm('navigation')
-        raise RuntimeError('target was not detected in any search area')
+                    if not self._is_seen_non_target(category, pose):
+                        self._stop_base()
+                        self._set_state('CONFIRM_CUBE')
+                        self._record_non_target(category, pose)
+                        time.sleep(self.search_settle_time)
+                        _, _, previous_yaw = self._base_pose_odom()
+                        self._set_state('ROTATE_SEARCH')
+
+                self.cmd_vel_pub.publish(command)
+                time.sleep(period)
+        finally:
+            self._stop_base()
+
+        self._move_arm('navigation')
+        if rospy.is_shutdown():
+            raise RuntimeError('search rotation interrupted by shutdown')
+        if time.monotonic() >= deadline:
+            raise RuntimeError('search rotation timeout')
+        raise RuntimeError('target was not detected during one search revolution')
 
     def _align_to_grasp(self, first_pose):
         self._set_state('ALIGN_TO_GRASP')

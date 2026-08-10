@@ -15,6 +15,8 @@ catkin_install_python(PROGRAMS
   scripts/cube_vision.py
   scripts/test_observe_grasp.py
   scripts/pick_place_executor.py
+  scripts/test_move_base_goal.py
+  scripts/mark_cube_areas.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
