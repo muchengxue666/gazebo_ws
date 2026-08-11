@@ -14,7 +14,6 @@ from control_msgs.msg import (
     FollowJointTrajectoryGoal,
     JointTolerance,
 )
-from gazebo_msgs.srv import GetModelState
 from geometry_msgs.msg import (
     Point,
     PointStamped,
@@ -33,13 +32,16 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 JOINT_NAMES = [
     'arm_joint1', 'arm_joint2', 'arm_joint3', 'arm_joint4', 'arm_joint5'
 ]
+TARGET_CATEGORIES = ('food', 'daily', 'electronics')
 
 
 class PickPlaceExecutor:
     def __init__(self):
-        self.target_category = rospy.get_param('~target_category', 'food').lower()
+        self.target_category = None
+        self.cube_category_topic = rospy.get_param(
+            '~cube_category_topic', '/cube_category')
         self.category_to_model = rospy.get_param('~category_to_model', {})
-        self.drop_areas = rospy.get_param('~drop_areas', {})
+        self.parking_areas = rospy.get_param('~parking_areas', {})
         self.map_bounds = rospy.get_param('~map_bounds', {})
         self.arm_poses = rospy.get_param('~arm_poses', {})
         self.arm_poses_verified = bool(
@@ -56,7 +58,6 @@ class PickPlaceExecutor:
         self.server_wait_timeout = float(
             rospy.get_param('~server_wait_timeout', 60.0))
         self.attach_timeout = float(rospy.get_param('~attach_timeout', 5.0))
-        self.release_timeout = float(rospy.get_param('~release_timeout', 5.0))
         self.joint_tolerance = float(
             rospy.get_param('~joint_tolerance', 0.03))
         self.goal_time_tolerance = float(
@@ -117,11 +118,15 @@ class PickPlaceExecutor:
             rospy.get_param('~search_rotation_max_drift', 0.08))
         self.search_settle_time = float(
             rospy.get_param('~search_settle_time', 0.5))
-        self.drop_margin = float(rospy.get_param('~drop_margin', 0.05))
-        self.drop_settle_samples = int(
-            rospy.get_param('~drop_settle_samples', 5))
-        self.drop_settle_delta = float(
-            rospy.get_param('~drop_settle_delta', 0.01))
+        self.parking_footprint = rospy.get_param('~parking_footprint', [])
+        self.parking_footprint_margin = float(
+            rospy.get_param('~parking_footprint_margin', 0.01))
+        self.parking_position_tolerance = float(
+            rospy.get_param('~parking_position_tolerance', 0.015))
+        self.parking_yaw_tolerance = float(
+            rospy.get_param('~parking_yaw_tolerance', 0.04))
+        self.parking_timeout = float(
+            rospy.get_param('~parking_timeout', 10.0))
         self.navigation_ready_timeout = float(
             rospy.get_param('~navigation_ready_timeout', 60.0))
         self.navigation_startup_delay = float(
@@ -178,8 +183,6 @@ class PickPlaceExecutor:
             FollowJointTrajectoryAction)
         self.clear_costmaps = rospy.ServiceProxy(
             '/move_base/clear_costmaps', Empty)
-        self.get_model_state = rospy.ServiceProxy(
-            '/gazebo/get_model_state', GetModelState)
 
         self.gripper_pub = rospy.Publisher(
             '/gripper_controller/command', Float64, queue_size=1)
@@ -209,6 +212,9 @@ class PickPlaceExecutor:
                              self._amcl_pose_cb),
         ])
         rospy.Subscriber('/cube_vision/category', String, self._category_cb)
+        rospy.Subscriber(
+            self.cube_category_topic, String, self._category_command_cb,
+            queue_size=1)
         rospy.Subscriber('/cube_vision/confidence', Float32, self._confidence_cb)
         rospy.Subscriber('/cube_vision/pose', PoseStamped, self._vision_pose_cb)
         rospy.Subscriber('/grasp_attach/ready', Bool, self._ready_cb)
@@ -219,14 +225,16 @@ class PickPlaceExecutor:
 
         rospy.on_shutdown(self._cancel_actions)
         self._validate_config()
+        rospy.set_param('/gazebo_success', 0)
 
     def _validate_config(self):
-        if self.target_category not in self.category_to_model:
-            raise rospy.ROSInitException(
-                'target_category has no model mapping: ' + self.target_category)
-        if self.target_category not in self.drop_areas:
-            raise rospy.ROSInitException(
-                'target_category has no drop area: ' + self.target_category)
+        for category in TARGET_CATEGORIES:
+            if category not in self.category_to_model:
+                raise rospy.ROSInitException(
+                    'category has no model mapping: ' + category)
+            if category not in self.parking_areas:
+                raise rospy.ROSInitException(
+                    'category has no parking area: ' + category)
         required_pose = ('x', 'y', 'yaw')
         if (not isinstance(self.search_pose, dict)
                 or any(key not in self.search_pose for key in required_pose)):
@@ -294,6 +302,20 @@ class PickPlaceExecutor:
         required_bounds = ('x_min', 'x_max', 'y_min', 'y_max')
         if any(key not in self.map_bounds for key in required_bounds):
             raise rospy.ROSInitException('map_bounds is incomplete')
+        if (not isinstance(self.parking_footprint, list)
+                or len(self.parking_footprint) < 3):
+            raise rospy.ROSInitException('parking_footprint is incomplete')
+        for vertex in self.parking_footprint:
+            if (not isinstance(vertex, list) or len(vertex) != 2
+                    or not all(math.isfinite(float(value)) for value in vertex)):
+                raise rospy.ROSInitException('parking_footprint contains invalid values')
+        for name, value in (
+                ('parking_footprint_margin', self.parking_footprint_margin),
+                ('parking_position_tolerance', self.parking_position_tolerance),
+                ('parking_yaw_tolerance', self.parking_yaw_tolerance),
+                ('parking_timeout', self.parking_timeout)):
+            if not math.isfinite(value) or value <= 0.0:
+                raise rospy.ROSInitException(name + ' must be positive')
 
     def _read_arm_pose(self, name):
         pose = self.arm_poses.get(name)
@@ -340,6 +362,23 @@ class PickPlaceExecutor:
     def _category_cb(self, msg):
         self.category = msg.data.lower()
 
+    def _category_command_cb(self, msg):
+        category = msg.data.strip().lower()
+        if category == 'electronic':
+            category = 'electronics'
+        if category not in TARGET_CATEGORIES:
+            rospy.logwarn(
+                'ignoring invalid cube_category=%r; expected one of %s',
+                msg.data, ', '.join(TARGET_CATEGORIES))
+            return
+        if self.target_category is not None:
+            rospy.logwarn(
+                'ignoring cube_category=%s; task already selected %s',
+                category, self.target_category)
+            return
+        self.target_category = category
+        rospy.loginfo('accepted cube_category=%s', category)
+
     def _confidence_cb(self, msg):
         self.confidence = float(msg.data)
 
@@ -368,6 +407,16 @@ class PickPlaceExecutor:
         rospy.loginfo('pick_place state: %s', state)
         self.state_pub.publish(String(data=state))
 
+    def wait_for_target_category(self):
+        self._set_state('WAITING_FOR_CATEGORY')
+        rospy.loginfo(
+            'waiting for std_msgs/String on %s: %s',
+            self.cube_category_topic, ', '.join(TARGET_CATEGORIES))
+        while not rospy.is_shutdown() and self.target_category is None:
+            time.sleep(0.05)
+        if self.target_category is None:
+            raise RuntimeError('category wait interrupted by shutdown')
+
     def _stop_base(self):
         self.cmd_vel_pub.publish(Twist())
 
@@ -375,6 +424,35 @@ class PickPlaceExecutor:
         self._stop_base()
         self.nav_client.cancel_all_goals()
         self.arm_client.cancel_all_goals()
+
+    def _recover_after_failure(self):
+        """Leave the robot in a safe, reusable state after a task error."""
+        self._set_state('RECOVER_FAILURE')
+        self._cancel_actions()
+
+        try:
+            self._command_gripper(self.gripper_open, 'failure open')
+        except (rospy.ROSException, RuntimeError) as exc:
+            rospy.logwarn('failure recovery could not open gripper: %s', exc)
+
+        # Give grasp_attach a wall-time window to publish IDLE after opening.
+        deadline = time.monotonic() + 2.0
+        while (not rospy.is_shutdown() and time.monotonic() < deadline
+               and (self.grasp_state != 'IDLE' or self.attached_model)):
+            time.sleep(0.05)
+
+        if self.grasp_state != 'IDLE' or self.attached_model:
+            rospy.logwarn(
+                'failure recovery will not move arm while attachment remains: '
+                'state=%s model=%s', self.grasp_state, self.attached_model)
+            self._stop_base()
+            return
+
+        try:
+            self._move_arm('navigation')
+        except (rospy.ROSException, RuntimeError) as exc:
+            rospy.logwarn('failure recovery could not raise arm: %s', exc)
+        self._stop_base()
 
     def _wait_for_action_server(self, client, label):
         # actionlib's timeout uses simulated ROS time. During Gazebo startup
@@ -754,7 +832,7 @@ class PickPlaceExecutor:
             self.nav_client.send_goal(self._move_base_goal(x, y, yaw))
             deadline = time.monotonic() + self.nav_timeout
             while not rospy.is_shutdown() and time.monotonic() < deadline:
-                if (label.startswith('drop approach')
+                if (label.startswith('parking approach')
                         and (self.grasp_state != 'GRASPING'
                              or self.attached_model != self.category_to_model[
                                  self.target_category])):
@@ -1051,107 +1129,89 @@ class PickPlaceExecutor:
             raise RuntimeError('object is not inside the tcp grasp box')
         self._command_gripper(self.gripper_close, 'close')
         self._wait_attach()
+        # grasp_attach echoes the threshold-crossing joint position back to
+        # the controller; reassert the configured close target for transport.
+        self._command_gripper(self.gripper_close, 'hold')
 
-    def _navigate_to_drop(self):
-        self._set_state('NAVIGATE_TO_DROP')
-        # Change to the verified placement posture before computing the
-        # placement TCP offset. The attached model follows tcp_link while the
-        # base is transported.
+    def _parking_footprint_inside(self, x, y, yaw, area):
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        margin = self.parking_footprint_margin
+        x_min = float(area['x_min']) + margin
+        x_max = float(area['x_max']) - margin
+        y_min = float(area['y_min']) + margin
+        y_max = float(area['y_max']) - margin
+        for vertex_x, vertex_y in self.parking_footprint:
+            point_x = x + cos_yaw * float(vertex_x) - sin_yaw * float(vertex_y)
+            point_y = y + sin_yaw * float(vertex_x) + cos_yaw * float(vertex_y)
+            if not (x_min <= point_x <= x_max and y_min <= point_y <= y_max):
+                return False
+        return True
+
+    def _fine_align_to_parking(self, target_x, target_y, target_yaw, area):
+        self._set_state('FINE_ALIGN_TO_PARKING')
+        deadline = time.monotonic() + self.parking_timeout
+        period = 1.0 / self.fine_align_rate
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            self._check_attachment()
+            base_x, base_y, base_yaw = self._base_pose_map()
+            dx = target_x - base_x
+            dy = target_y - base_y
+            yaw_error = math.atan2(
+                math.sin(target_yaw - base_yaw),
+                math.cos(target_yaw - base_yaw))
+            if (math.hypot(dx, dy) <= self.parking_position_tolerance
+                    and abs(yaw_error) <= self.parking_yaw_tolerance
+                    and self._parking_footprint_inside(
+                        base_x, base_y, base_yaw, area)):
+                self._stop_base()
+                return
+
+            cos_yaw = math.cos(base_yaw)
+            sin_yaw = math.sin(base_yaw)
+            local_x = cos_yaw * dx + sin_yaw * dy
+            local_y = -sin_yaw * dx + cos_yaw * dy
+            command = Twist()
+            command.linear.x = self._clamp(
+                self.fine_align_linear_gain * local_x,
+                self.fine_align_max_linear_speed)
+            command.linear.y = self._clamp(
+                self.fine_align_linear_gain * local_y,
+                self.fine_align_max_linear_speed)
+            command.angular.z = self._clamp(
+                self.fine_align_angular_gain * yaw_error,
+                self.fine_align_max_angular_speed)
+            self.cmd_vel_pub.publish(command)
+            time.sleep(period)
+        self._stop_base()
+        raise RuntimeError('vehicle footprint did not settle inside parking area')
+
+    def _navigate_to_parking(self):
+        self._set_state('NAVIGATE_TO_PARKING')
+        # Keep the attached object in the raised transport posture throughout.
         self._move_arm('transport')
-        # The base goal is computed for the placement posture, but navigation
-        # itself stays in the raised transport posture.
-        area = self.drop_areas[self.target_category]
-        drop_x = 0.5 * (float(area['x_min']) + float(area['x_max']))
-        drop_y = 0.5 * (float(area['y_min']) + float(area['y_max']))
-        _, _, current_yaw = self._base_pose_map()
-        headings = [current_yaw, 0.0, math.pi / 2.0, -math.pi / 2.0, math.pi]
-        tcp_x, tcp_y, _ = self.place_tcp_in_base
-        for index, yaw in enumerate(headings):
-            goal_x = drop_x - (math.cos(yaw) * tcp_x - math.sin(yaw) * tcp_y)
-            goal_y = drop_y - (math.sin(yaw) * tcp_x + math.cos(yaw) * tcp_y)
-            if self._navigate(
-                    goal_x, goal_y, yaw,
-                    'drop approach {}'.format(index), retries=0):
-                self._check_attachment()
-                return
-        raise RuntimeError('no drop approach goal was reachable')
-
-    def _wait_release(self):
-        deadline = rospy.Time.now() + rospy.Duration(self.release_timeout)
-        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-            if self.grasp_state == 'IDLE' and not self.attached_model:
-                return
-            rospy.sleep(0.05)
-        raise RuntimeError('object did not release')
-
-    def _world_point_to_map(self, point_world):
-        # Gazebo exposes model states in its world frame, while task areas are
-        # map coordinates. Derive the planar world->map transform from the
-        # robot pose instead of assuming both frames share an origin.
-        try:
-            response = self.get_model_state('car3', 'world')
-        except rospy.ServiceException as exc:
-            raise RuntimeError('car3 world state unavailable: {}'.format(exc))
-        if not response.success:
-            raise RuntimeError('car3 world state unavailable: ' + response.status_message)
-        robot_world = response.pose
-        robot_q = [robot_world.orientation.x, robot_world.orientation.y,
-                   robot_world.orientation.z, robot_world.orientation.w]
-        robot_yaw = transformations.euler_from_quaternion(robot_q)[2]
-        base_x, base_y, base_yaw = self._base_pose_map()
-        dx = point_world.x - robot_world.position.x
-        dy = point_world.y - robot_world.position.y
-        cos_world = math.cos(robot_yaw)
-        sin_world = math.sin(robot_yaw)
-        local_x = cos_world * dx + sin_world * dy
-        local_y = -sin_world * dx + cos_world * dy
-        cos_map = math.cos(base_yaw)
-        sin_map = math.sin(base_yaw)
-        return (base_x + cos_map * local_x - sin_map * local_y,
-                base_y + sin_map * local_x + cos_map * local_y,
-                point_world.z)
-
-    def _verify_drop(self):
-        model = self.category_to_model[self.target_category]
-        area = self.drop_areas[self.target_category]
-        x_min = float(area['x_min']) + self.drop_margin
-        x_max = float(area['x_max']) - self.drop_margin
-        y_min = float(area['y_min']) + self.drop_margin
-        y_max = float(area['y_max']) - self.drop_margin
-        z_min = float(rospy.get_param('~drop_z_min', 0.0))
-        z_max = float(rospy.get_param('~drop_z_max', 0.12))
-        previous = None
-        settled = 0
-        deadline = rospy.Time.now() + rospy.Duration(5.0)
-        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-            try:
-                response = self.get_model_state(model, 'world')
-            except rospy.ServiceException as exc:
-                raise RuntimeError('get_model_state failed: {}'.format(exc))
-            if not response.success:
-                raise RuntimeError('model state unavailable: ' + response.status_message)
-            map_x, map_y, map_z = self._world_point_to_map(response.pose.position)
-            if not (x_min <= map_x <= x_max and y_min <= map_y <= y_max
-                    and z_min <= map_z <= z_max):
-                settled = 0
-                previous = None
-                rospy.sleep(0.2)
+        self._check_attachment()
+        area = self.parking_areas[self.target_category]
+        target_x = 0.5 * (float(area['x_min']) + float(area['x_max']))
+        target_y = 0.5 * (float(area['y_min']) + float(area['y_max']))
+        for index, target_yaw in enumerate((0.0, math.pi)):
+            if not self._navigate(
+                    target_x, target_y, target_yaw,
+                    'parking approach {}'.format(index), retries=0):
                 continue
-            if previous is not None:
-                delta = math.hypot(map_x - previous[0], map_y - previous[1])
-                settled = settled + 1 if delta <= self.drop_settle_delta else 0
-                if settled >= self.drop_settle_samples:
-                    return
-            previous = (map_x, map_y)
-            rospy.sleep(0.2)
-        raise RuntimeError('released model is not stable inside the drop area')
-
-    def _place(self):
-        self._set_state('PLACE')
-        self._move_arm('place')
-        self._command_gripper(self.gripper_open, 'open')
-        self._wait_release()
-        self._verify_drop()
+            try:
+                self._fine_align_to_parking(
+                    target_x, target_y, target_yaw, area)
+                self._check_attachment()
+                self._set_state('PARKED')
+                return
+            except RuntimeError as exc:
+                if (self.grasp_state != 'GRASPING'
+                        or self.attached_model != self.category_to_model[
+                            self.target_category]):
+                    raise
+                rospy.logwarn('parking alignment failed: %s', exc)
+        raise RuntimeError('no parking approach goal was reachable')
 
     def run(self):
         self._set_state('INIT_VALIDATE')
@@ -1169,8 +1229,6 @@ class PickPlaceExecutor:
         rospy.loginfo('arm trajectory action server is ready')
         if not self._wait_joint_state(8.0):
             raise RuntimeError('joint state unavailable')
-        rospy.wait_for_service('/gazebo/get_model_state', timeout=10.0)
-
         self._set_state('RESET_GRIPPER')
         self._command_gripper(self.gripper_open, 'open')
         deadline = rospy.Time.now() + rospy.Duration(2.0)
@@ -1181,8 +1239,9 @@ class PickPlaceExecutor:
         if self.grasp_state != 'IDLE' or self.attached_model:
             raise RuntimeError('grasp backend is not idle')
 
-        # Keep the model's default arm posture for the first coarse navigation.
-        # Later base motions still raise the arm after observe/grasp/place.
+        # Always start coarse navigation from the verified laser-safe posture;
+        # a previous task may have left the arm in its place posture.
+        self._move_arm('navigation')
         self._wait_for_navigation_ready()
 
         # Search first. Geometry measurement moves through grasp/place poses
@@ -1192,12 +1251,11 @@ class PickPlaceExecutor:
         self._align_to_grasp(detection)
         self._prepare_stationary_grasp()
         self._grasp()
-        self._move_arm('transport')
-        self._navigate_to_drop()
-        self._place()
+        self._navigate_to_parking()
         self._set_state('SUCCESS')
+        rospy.set_param('/gazebo_success', 1)
         self.result_pub.publish(String(data='SUCCESS:' + self.target_category))
-        rospy.loginfo('pick-place succeeded for %s', self.target_category)
+        rospy.loginfo('pick-park succeeded for %s', self.target_category)
 
 
 def main():
@@ -1205,16 +1263,16 @@ def main():
     executor = None
     try:
         executor = PickPlaceExecutor()
-        if not bool(rospy.get_param('~start_task', False)):
-            executor._set_state('WAITING_TO_START')
-            rospy.loginfo(
-                'Set ~start_task=true and relaunch to run the single-object task')
-            rospy.spin()
-            return
+        executor.wait_for_target_category()
         executor.run()
     except (rospy.ROSException, rospy.ROSInitException, RuntimeError) as exc:
-        rospy.logerr('pick-place FAILED: %s', exc)
+        rospy.logerr('pick-park FAILED: %s', exc)
+        rospy.set_param('/gazebo_success', 0)
         if executor is not None:
+            try:
+                executor._recover_after_failure()
+            except (rospy.ROSException, RuntimeError) as recovery_exc:
+                rospy.logerr('pick-place failure recovery failed: %s', recovery_exc)
             executor._set_state('FAILED')
             executor.result_pub.publish(String(data='FAILED:' + str(exc)))
         raise SystemExit(1)

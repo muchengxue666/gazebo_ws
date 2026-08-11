@@ -2,9 +2,8 @@
   <arg name="gui" default="true"/>
   <arg name="rviz" default="true"/>
   <arg name="spawn_dynamic_objects" default="true"/>
-  <arg name="start_task" default="false"/>
   <arg name="arm_poses_verified" default="false"/>
-  <arg name="target_category" default="food"/>
+  <arg name="cube_category_topic" default="/cube_category"/>
 
   <!-- Canonical validated navigation entry; do not replace with gazebo_nav.launch. -->
   <!-- The immutable attach backend uses a strict '<' close check. A threshold
@@ -35,8 +34,7 @@
         type="pick_place_executor.py" output="screen">
     <rosparam file="$(find car3)/config/nav_pick_place_task.yaml"
               command="load"/>
-    <param name="target_category" value="$(arg target_category)"/>
-    <param name="start_task" value="$(arg start_task)"/>
+    <param name="cube_category_topic" value="$(arg cube_category_topic)"/>
     <param name="arm_poses_verified" value="$(arg arm_poses_verified)"/>
   </node>
 </launch>

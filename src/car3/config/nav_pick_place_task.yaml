@@ -1,7 +1,6 @@
-# Independent first-stage task configuration.
-# Navigation remains the validated static_nav_sim chain.
-target_category: food
-start_task: false
+# External command topic. The robot waits at its spawn pose until one valid
+# std_msgs/String category is received.
+cube_category_topic: /cube_category
 arm_poses_verified: false
 
 category_to_model:
@@ -16,10 +15,10 @@ search_areas:
   area_b: {x_min: -1.56, x_max: -1.23, y_min: -0.01, y_max: 0.17}
   area_c: {x_min: -0.95, x_max: -0.77, y_min: -0.69, y_max: -0.36}
 
-drop_areas:
+parking_areas:
   food: {x_min: 0.75, x_max: 1.25, y_min: -3.23, y_max: -2.73}
+  daily: {x_min: 0.75, x_max: 1.25, y_min: -1.75, y_max: -1.25}
   electronics: {x_min: 2.30, x_max: 2.80, y_min: -2.47, y_max: -1.97}
-  # daily is intentionally omitted until its map coordinates are verified.
 
 map_bounds:
   x_min: -2.4696
@@ -65,9 +64,8 @@ navigation_pose_tolerance: 0.03
 navigation_data_timeout: 2.5
 navigation_min_costmap_updates: 3
 attach_timeout: 5.0
-release_timeout: 5.0
 nav_retries: 1
-max_align_iterations: 2
+max_align_iterations: 3
 max_align_step: 0.15
 align_xy_tolerance: 0.012
 # Last 8 cm use bounded low-speed /cmd_vel feedback; move_base handles the
@@ -85,7 +83,8 @@ align_fresh_pose_samples: 3
 align_fresh_pose_timeout: 3.0
 align_fresh_pose_max_span: 0.02
 align_settle_time: 0.5
-max_grasp_offset: 0.015
+# Match grasp_attach's immutable 20 mm per-axis readiness box.
+max_grasp_offset: 0.020
 vision_reset_service: /cube_vision/reset
 # spawn_cubes ranges are expressed in Gazebo world, while detections are in
 # AMCL map; allow the observed map/world localization offset in simulation.
@@ -109,9 +108,15 @@ search_rotation_rate: 20.0
 search_rotation_max_drift: 0.08
 # Spatial tolerance used to avoid stopping repeatedly on one non-target cube.
 search_detection_dedupe_distance: 0.05
-drop_margin: 0.05
-drop_settle_samples: 5
-drop_settle_delta: 0.01
+# The vehicle, not the cube, must fit completely inside the marked workshop.
+parking_footprint: [[0.190, -0.060], [0.145, -0.131],
+                    [-0.145, -0.131], [-0.164, -0.066],
+                    [-0.164, 0.066], [-0.145, 0.131],
+                    [0.145, 0.131], [0.190, 0.060]]
+parking_footprint_margin: 0.01
+parking_position_tolerance: 0.015
+parking_yaw_tolerance: 0.04
+parking_timeout: 10.0
 joint_tolerance: 0.03
 goal_time_tolerance: 1.5
 # Gazebo joint-state samples show ~0.0024 rad controller quantization near
