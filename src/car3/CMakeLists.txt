@@ -18,6 +18,7 @@ catkin_install_python(PROGRAMS
   scripts/pick_place_executor.py
   scripts/test_move_base_goal.py
   scripts/mark_cube_areas.py
+  scripts/tcp_ros_bridge.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

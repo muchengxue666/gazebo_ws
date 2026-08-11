@@ -2,8 +2,11 @@
   <arg name="gui" default="true"/>
   <arg name="rviz" default="true"/>
   <arg name="spawn_dynamic_objects" default="true"/>
-  <arg name="arm_poses_verified" default="false"/>
+  <arg name="arm_poses_verified" default="true"/>
   <arg name="cube_category_topic" default="/cube_category"/>
+  <arg name="tcp_bridge" default="true"/>
+  <arg name="tcp_remote_host" default="192.168.10.246"/>
+  <arg name="tcp_remote_port" default="9000"/>
 
   <!-- Canonical validated navigation entry; do not replace with gazebo_nav.launch. -->
   <!-- The immutable attach backend uses a strict '<' close check. A threshold
@@ -36,5 +39,12 @@
               command="load"/>
     <param name="cube_category_topic" value="$(arg cube_category_topic)"/>
     <param name="arm_poses_verified" value="$(arg arm_poses_verified)"/>
+  </node>
+
+  <node if="$(arg tcp_bridge)" name="tcp_ros_bridge" pkg="car3"
+        type="tcp_ros_bridge.py" output="screen">
+    <param name="remote_host" value="$(arg tcp_remote_host)"/>
+    <param name="remote_port" value="$(arg tcp_remote_port)"/>
+    <param name="category_topic" value="$(arg cube_category_topic)"/>
   </node>
 </launch>
