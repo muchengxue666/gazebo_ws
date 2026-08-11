@@ -89,17 +89,17 @@ vision_reset_service: /cube_vision/reset
 # spawn_cubes ranges are expressed in Gazebo world, while detections are in
 # AMCL map; allow the observed map/world localization offset in simulation.
 search_area_match_margin: 0.10
-# Fixed map pose captured from the successful search-camera setup.
-search_pose: {x: -1.40, y: -0.4311, yaw: 1.7201}
-# Search in order. The first waypoint is the verified pose; the latter two
-# are conservative area-B/area-C candidates and must remain navigation-arm
-# poses until their camera coverage is confirmed.
-search_waypoints:
-  - {x: -1.40, y: -0.4311, yaw: 1.7201}
-  - {x: -1.40, y: -0.20, yaw: 1.5708}
-  - {x: -1.20, y: -0.53, yaw: 0.0}
-# Experimental direct rotation while observe is active. This bypasses
-# move_base collision checking because the lowered arm blocks raw /scan.
+# First try one broad rotating search from the verified camera pose.
+coarse_search_pose: {x: -1.40, y: -0.4311, yaw: 1.7201}
+# If the broad search misses, observe each source area from one fixed pose.
+# The base remains stationary at these three viewpoints.
+area_search_waypoints:
+  - {area: area_a, x: -1.35, y: -0.4311, yaw: 1.7201}
+  - {area: area_b, x: -1.40, y: -0.40, yaw: 0.0}
+  - {area: area_c, x: -1.20, y: -0.53, yaw: -1.5708}
+area_search_timeout: 6.0
+# The coarse direct rotation bypasses move_base collision checking because
+# the lowered observe arm blocks raw /scan.
 search_settle_time: 0.5
 search_rotation_speed: -0.20
 search_rotation_angle: 6.283185

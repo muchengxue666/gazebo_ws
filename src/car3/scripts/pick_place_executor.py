@@ -90,9 +90,12 @@ class PickPlaceExecutor:
             rospy.get_param('~fine_align_yaw_tolerance', 0.04))
         self.align_z_tolerance = float(
             rospy.get_param('~align_z_tolerance', 0.03))
-        self.search_pose = rospy.get_param('~search_pose', {})
-        self.search_waypoints = rospy.get_param(
-            '~search_waypoints', [self.search_pose])
+        self.coarse_search_pose = rospy.get_param(
+            '~coarse_search_pose', {})
+        self.area_search_waypoints = rospy.get_param(
+            '~area_search_waypoints', [])
+        self.area_search_timeout = float(
+            rospy.get_param('~area_search_timeout', 6.0))
         self.search_areas = rospy.get_param('~search_areas', {})
         self.vision_reset_service = rospy.get_param(
             '~vision_reset_service', '/cube_vision/reset')
@@ -236,31 +239,46 @@ class PickPlaceExecutor:
                 raise rospy.ROSInitException(
                     'category has no parking area: ' + category)
         required_pose = ('x', 'y', 'yaw')
-        if (not isinstance(self.search_pose, dict)
-                or any(key not in self.search_pose for key in required_pose)):
-            raise rospy.ROSInitException('search_pose is incomplete')
-        if not all(math.isfinite(float(self.search_pose[key]))
+        if (not isinstance(self.coarse_search_pose, dict)
+                or any(key not in self.coarse_search_pose
+                       for key in required_pose)):
+            raise rospy.ROSInitException('coarse_search_pose is incomplete')
+        if not all(math.isfinite(float(self.coarse_search_pose[key]))
                    for key in required_pose):
-            raise rospy.ROSInitException('search_pose contains invalid values')
+            raise rospy.ROSInitException(
+                'coarse_search_pose contains invalid values')
         if not self._inside_map(
-                float(self.search_pose['x']), float(self.search_pose['y'])):
-            raise rospy.ROSInitException('search_pose is outside map bounds')
-        if (not isinstance(self.search_waypoints, list)
-                or not self.search_waypoints):
-            raise rospy.ROSInitException('search_waypoints is empty')
-        for index, waypoint in enumerate(self.search_waypoints):
+                float(self.coarse_search_pose['x']),
+                float(self.coarse_search_pose['y'])):
+            raise rospy.ROSInitException(
+                'coarse_search_pose is outside map bounds')
+        if (not isinstance(self.area_search_waypoints, list)
+                or not self.area_search_waypoints):
+            raise rospy.ROSInitException('area_search_waypoints is empty')
+        configured_areas = []
+        for index, waypoint in enumerate(self.area_search_waypoints):
             if (not isinstance(waypoint, dict)
-                    or any(key not in waypoint for key in ('x', 'y', 'yaw'))):
+                    or any(key not in waypoint
+                           for key in ('area', 'x', 'y', 'yaw'))):
                 raise rospy.ROSInitException(
-                    'search_waypoints[{}] is incomplete'.format(index))
+                    'area_search_waypoints[{}] is incomplete'.format(index))
             if not all(math.isfinite(float(waypoint[key]))
                         for key in ('x', 'y', 'yaw')):
                 raise rospy.ROSInitException(
-                    'search_waypoints[{}] contains invalid values'.format(index))
+                    'area_search_waypoints[{}] contains invalid values'.format(
+                        index))
             if not self._inside_map(
                     float(waypoint['x']), float(waypoint['y'])):
                 raise rospy.ROSInitException(
-                    'search_waypoints[{}] is outside map bounds'.format(index))
+                    'area_search_waypoints[{}] is outside map bounds'.format(
+                        index))
+            configured_areas.append(str(waypoint['area']))
+        if configured_areas != ['area_a', 'area_b', 'area_c']:
+            raise rospy.ROSInitException(
+                'area_search_waypoints must be ordered area_a, area_b, area_c')
+        if (not math.isfinite(self.area_search_timeout)
+                or self.area_search_timeout <= 0.0):
+            raise rospy.ROSInitException('area_search_timeout must be positive')
         if (not math.isfinite(self.search_rotation_speed)
                 or self.search_rotation_speed == 0.0):
             raise rospy.ROSInitException(
@@ -665,8 +683,7 @@ class PickPlaceExecutor:
         pose = self.vision_pose
         received = self.vision_pose_received
         category = self.vision_pose_category
-        if (pose is None or category not in self.category_to_model
-                or category != self.category):
+        if pose is None or category not in self.category_to_model:
             return None
         stamp = pose.header.stamp
         age = ((rospy.Time.now() - stamp).to_sec()
@@ -763,6 +780,15 @@ class PickPlaceExecutor:
             rospy.sleep(0.05)
         return None
 
+    def _fresh_known_detection(self, since_received, timeout):
+        deadline = time.monotonic() + timeout
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            detection = self._current_known_detection(since_received)
+            if detection is not None:
+                return detection
+            time.sleep(0.05)
+        return None
+
     def _point_in_frame(self, pose, target_frame):
         point = PointStamped()
         point.header = pose.header
@@ -855,13 +881,13 @@ class PickPlaceExecutor:
         rospy.logwarn('%s navigation failed', label)
         return False
 
-    def _search_at_waypoint(self, waypoint, index):
+    def _rotate_search_at_pose(self, waypoint):
         search_x = float(waypoint['x'])
         search_y = float(waypoint['y'])
         search_yaw = float(waypoint['yaw'])
-        label = 'search waypoint {}'.format(index)
+        label = 'coarse search'
         if not self._navigate(search_x, search_y, search_yaw, label, retries=0):
-            rospy.logwarn('%s navigation failed; trying next waypoint', label)
+            rospy.logwarn('%s navigation failed; trying fixed area searches', label)
             return None
         self._stop_base()
         time.sleep(self.search_settle_time)
@@ -934,14 +960,59 @@ class PickPlaceExecutor:
         rospy.loginfo('%s completed without target; continuing search', label)
         return None
 
+    def _search_area_waypoint(self, waypoint, index):
+        area = str(waypoint['area'])
+        label = 'area search {} ({})'.format(index, area)
+        if not self._navigate(
+                float(waypoint['x']), float(waypoint['y']),
+                float(waypoint['yaw']), label, retries=0):
+            rospy.logwarn('%s navigation failed; trying next area', label)
+            return None
+
+        self._stop_base()
+        time.sleep(self.search_settle_time)
+        self._move_arm('observe')
+        since_received = self.vision_pose_received
+        try:
+            self.vision_reset()
+        except rospy.ServiceException as exc:
+            rospy.logwarn('vision reset failed at %s: %s', label, exc)
+
+        self._set_state('OBSERVE_' + area.upper())
+        detection = self._fresh_known_detection(
+            since_received, self.area_search_timeout)
+        self._stop_base()
+        if detection is None:
+            rospy.loginfo('%s completed without a cube', label)
+            self._move_arm('navigation')
+            return None
+
+        category, pose = detection
+        self._set_state('CONFIRM_CUBE')
+        if category == self.target_category:
+            self.detected_category_pub.publish(String(data=category))
+            rospy.loginfo(
+                'confirmed target cube: category=%s confidence=%.3f at %s',
+                category, self.vision_pose_confidence, area)
+            return pose
+
+        if not self._is_seen_non_target(category, pose):
+            self._record_non_target(category, pose)
+        rospy.loginfo('%s contains non-target %s; trying next area', area, category)
+        self._move_arm('navigation')
+        return None
+
     def _search(self):
         self._set_state('SEARCH_SOURCE')
-        for index, waypoint in enumerate(self.search_waypoints):
-            pose = self._search_at_waypoint(waypoint, index)
+        pose = self._rotate_search_at_pose(self.coarse_search_pose)
+        if pose is not None:
+            return pose
+        for index, waypoint in enumerate(self.area_search_waypoints):
+            pose = self._search_area_waypoint(waypoint, index)
             if pose is not None:
                 return pose
         raise RuntimeError(
-            'target was not detected at any configured search waypoint')
+            'target was not detected by coarse or fixed area searches')
 
     @staticmethod
     def _clamp(value, limit):
