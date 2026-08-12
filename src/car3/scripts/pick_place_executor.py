@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import collections
 import math
 import time
 
@@ -35,6 +36,10 @@ JOINT_NAMES = [
 TARGET_CATEGORIES = ('food', 'daily', 'electronics')
 
 
+class GraspPreparationError(RuntimeError):
+    pass
+
+
 class PickPlaceExecutor:
     def __init__(self):
         self.target_category = None
@@ -58,6 +63,10 @@ class PickPlaceExecutor:
         self.server_wait_timeout = float(
             rospy.get_param('~server_wait_timeout', 60.0))
         self.attach_timeout = float(rospy.get_param('~attach_timeout', 5.0))
+        self.grasp_prepare_retries = int(
+            rospy.get_param('~grasp_prepare_retries', 2))
+        self.grasp_retry_max_target_shift = float(
+            rospy.get_param('~grasp_retry_max_target_shift', 0.12))
         self.joint_tolerance = float(
             rospy.get_param('~joint_tolerance', 0.03))
         self.goal_time_tolerance = float(
@@ -96,6 +105,21 @@ class PickPlaceExecutor:
             '~area_search_waypoints', [])
         self.area_search_timeout = float(
             rospy.get_param('~area_search_timeout', 6.0))
+        self.area_search_pan_offsets = [
+            float(value) for value in rospy.get_param(
+                '~area_search_pan_offsets', [0.25, -0.25])]
+        self.area_search_pan_timeout = float(
+            rospy.get_param('~area_search_pan_timeout', 4.0))
+        self.area_search_view_settle_time = float(
+            rospy.get_param('~area_search_view_settle_time', 0.8))
+        self.area_search_passes = int(
+            rospy.get_param('~area_search_passes', 2))
+        self.search_target_confirmations = int(
+            rospy.get_param('~search_target_confirmations', 2))
+        self.search_target_confirm_timeout = float(
+            rospy.get_param('~search_target_confirm_timeout', 4.0))
+        self.search_target_confirm_distance = float(
+            rospy.get_param('~search_target_confirm_distance', 0.05))
         self.search_areas = rospy.get_param('~search_areas', {})
         self.vision_reset_service = rospy.get_param(
             '~vision_reset_service', '/cube_vision/reset')
@@ -121,6 +145,14 @@ class PickPlaceExecutor:
             rospy.get_param('~search_rotation_max_drift', 0.08))
         self.search_settle_time = float(
             rospy.get_param('~search_settle_time', 0.5))
+        self.search_direct_max_distance = float(
+            rospy.get_param('~search_direct_max_distance', 0.30))
+        self.search_direct_timeout = float(
+            rospy.get_param('~search_direct_timeout', 10.0))
+        self.search_direct_max_linear_speed = float(
+            rospy.get_param('~search_direct_max_linear_speed', 0.15))
+        self.search_direct_max_angular_speed = float(
+            rospy.get_param('~search_direct_max_angular_speed', 0.50))
         self.parking_footprint = rospy.get_param('~parking_footprint', [])
         self.parking_footprint_margin = float(
             rospy.get_param('~parking_footprint_margin', 0.01))
@@ -132,8 +164,6 @@ class PickPlaceExecutor:
             rospy.get_param('~parking_timeout', 10.0))
         self.navigation_ready_timeout = float(
             rospy.get_param('~navigation_ready_timeout', 60.0))
-        self.navigation_startup_delay = float(
-            rospy.get_param('~navigation_startup_delay', 5.0))
         self.navigation_stable_time = float(
             rospy.get_param('~navigation_stable_time', 3.0))
         self.navigation_pose_tolerance = float(
@@ -279,6 +309,32 @@ class PickPlaceExecutor:
         if (not math.isfinite(self.area_search_timeout)
                 or self.area_search_timeout <= 0.0):
             raise rospy.ROSInitException('area_search_timeout must be positive')
+        if (not self.area_search_pan_offsets
+                or not all(math.isfinite(value) and value != 0.0
+                           for value in self.area_search_pan_offsets)):
+            raise rospy.ROSInitException(
+                'area_search_pan_offsets must contain finite nonzero values')
+        if (not math.isfinite(self.area_search_pan_timeout)
+                or self.area_search_pan_timeout <= 0.0):
+            raise rospy.ROSInitException(
+                'area_search_pan_timeout must be positive')
+        if (not math.isfinite(self.area_search_view_settle_time)
+                or self.area_search_view_settle_time <= 0.0):
+            raise rospy.ROSInitException(
+                'area_search_view_settle_time must be positive')
+        if self.area_search_passes < 1:
+            raise rospy.ROSInitException(
+                'area_search_passes must be at least one')
+        if self.search_target_confirmations < 1:
+            raise rospy.ROSInitException(
+                'search_target_confirmations must be at least one')
+        for name, value in (
+                ('search_target_confirm_timeout',
+                 self.search_target_confirm_timeout),
+                ('search_target_confirm_distance',
+                 self.search_target_confirm_distance)):
+            if not math.isfinite(value) or value <= 0.0:
+                raise rospy.ROSInitException(name + ' must be positive')
         if (not math.isfinite(self.search_rotation_speed)
                 or self.search_rotation_speed == 0.0):
             raise rospy.ROSInitException(
@@ -297,6 +353,23 @@ class PickPlaceExecutor:
         if self.search_rotation_angle > 2.0 * math.pi + 0.01:
             raise rospy.ROSInitException(
                 'search_rotation_angle must not exceed one revolution')
+        if self.grasp_prepare_retries < 0:
+            raise rospy.ROSInitException(
+                'grasp_prepare_retries must not be negative')
+        if (not math.isfinite(self.grasp_retry_max_target_shift)
+                or self.grasp_retry_max_target_shift <= 0.0):
+            raise rospy.ROSInitException(
+                'grasp_retry_max_target_shift must be positive')
+        for name, value in (
+                ('search_direct_max_distance',
+                 self.search_direct_max_distance),
+                ('search_direct_timeout', self.search_direct_timeout),
+                ('search_direct_max_linear_speed',
+                 self.search_direct_max_linear_speed),
+                ('search_direct_max_angular_speed',
+                 self.search_direct_max_angular_speed)):
+            if not math.isfinite(value) or value <= 0.0:
+                raise rospy.ROSInitException(name + ' must be positive')
         for name, value in (
                 ('fine_align_distance', self.fine_align_distance),
                 ('fine_align_timeout', self.fine_align_timeout),
@@ -425,6 +498,12 @@ class PickPlaceExecutor:
         rospy.loginfo('pick_place state: %s', state)
         self.state_pub.publish(String(data=state))
 
+    @staticmethod
+    def _log_timing(stage, started, detail=''):
+        rospy.loginfo(
+            'timing %s: %.3f s%s', stage, time.monotonic() - started,
+            ' ' + detail if detail else '')
+
     def wait_for_target_category(self):
         self._set_state('WAITING_FOR_CATEGORY')
         rospy.loginfo(
@@ -538,10 +617,6 @@ class PickPlaceExecutor:
 
     def _wait_for_navigation_ready(self):
         self._set_state('WAIT_NAVIGATION_READY')
-        rospy.loginfo(
-            'waiting %.1f seconds for navigation startup to settle',
-            self.navigation_startup_delay)
-        time.sleep(self.navigation_startup_delay)
         deadline = time.monotonic() + self.navigation_ready_timeout
         stable_since = None
         previous_pose = None
@@ -585,8 +660,13 @@ class PickPlaceExecutor:
             'navigation stack not ready: {}'.format(
                 ', '.join(last_missing or ['pose stability'])))
 
-    def _move_arm(self, name):
+    def _move_arm(self, name, joint1_offset=0.0):
         positions, duration = self._read_arm_pose(name)
+        if joint1_offset:
+            positions[0] += float(joint1_offset)
+            if not -3.14 <= positions[0] <= 3.14:
+                raise RuntimeError(
+                    '{} joint1 compensation is outside limits'.format(name))
         goal = FollowJointTrajectoryGoal()
         goal.trajectory.joint_names = list(JOINT_NAMES)
         goal.trajectory.header.stamp = rospy.Time.now() + rospy.Duration(0.05)
@@ -642,10 +722,12 @@ class PickPlaceExecutor:
             rospy.sleep(0.05)
         raise RuntimeError(name + ' arm pose did not settle')
 
-    def _command_gripper(self, target, label):
+    def _command_gripper(self, target, label, attachment_satisfies=False):
         self.gripper_pub.publish(Float64(data=target))
         deadline = rospy.Time.now() + rospy.Duration(4.0)
         while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            if attachment_satisfies and self.grasp_state == 'GRASPING':
+                return
             position = self.joint_values.get('r_joint')
             if position is not None and abs(position - target) <= 0.04:
                 return
@@ -761,6 +843,22 @@ class PickPlaceExecutor:
                 return True
         return False
 
+    def _seen_category_at_pose(self, pose):
+        point = self._point_in_frame(pose, 'map').point
+        for seen_category, seen_x, seen_y in self.seen_non_target_cubes:
+            if math.hypot(point.x - seen_x, point.y - seen_y) <= \
+                    self.search_detection_dedupe_distance:
+                return seen_category
+        return None
+
+    def _detections_share_pose(self, first, second):
+        first_point = self._point_in_frame(first[1], 'map').point
+        second_point = self._point_in_frame(second[1], 'map').point
+        return math.hypot(
+            first_point.x - second_point.x,
+            first_point.y - second_point.y) <= \
+            self.search_detection_dedupe_distance
+
     def _record_non_target(self, category, pose):
         point = self._point_in_frame(pose, 'map').point
         self.seen_non_target_cubes.append((category, point.x, point.y))
@@ -788,6 +886,80 @@ class PickPlaceExecutor:
                 return detection
             time.sleep(0.05)
         return None
+
+    def _fresh_search_detection(self, barrier_seq, timeout):
+        deadline = time.monotonic() + timeout
+        accepted_seq = barrier_seq
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            if self.vision_pose_seq > accepted_seq:
+                accepted_seq = self.vision_pose_seq
+                detection = self._current_known_detection()
+                if detection is not None:
+                    return detection
+            time.sleep(0.05)
+        return None
+
+    def _confirm_search_target(self, initial_detection, label):
+        detections = [initial_detection]
+        initial_point = self._point_in_frame(initial_detection[1], 'map').point
+        for confirmation in range(self.search_target_confirmations):
+            time.sleep(self.area_search_view_settle_time)
+            barrier_seq = self.vision_pose_seq
+            try:
+                self.vision_reset()
+            except rospy.ServiceException as exc:
+                rospy.logwarn(
+                    'vision reset failed during %s target confirmation: %s',
+                    label, exc)
+            self._set_state('CONFIRM_TARGET')
+            detection = self._fresh_search_detection(
+                barrier_seq, self.search_target_confirm_timeout)
+            if detection is None:
+                rospy.logwarn(
+                    '%s target confirmation %d/%d produced no stable pose',
+                    label, confirmation + 1,
+                    self.search_target_confirmations)
+                continue
+            point = self._point_in_frame(detection[1], 'map').point
+            distance = math.hypot(
+                point.x - initial_point.x, point.y - initial_point.y)
+            if distance > self.search_target_confirm_distance:
+                rospy.logwarn(
+                    '%s target confirmation %d/%d rejected distant pose: '
+                    'category=%s distance=%.3f',
+                    label, confirmation + 1,
+                    self.search_target_confirmations,
+                    detection[0], distance)
+                continue
+            detections.append(detection)
+            rospy.loginfo(
+                '%s target confirmation %d/%d sampled: category=%s '
+                'distance=%.3f',
+                label, confirmation + 1,
+                self.search_target_confirmations,
+                detection[0], distance)
+        required_votes = (self.search_target_confirmations + 2) // 2
+        counts = collections.Counter(item[0] for item in detections)
+        category, votes = counts.most_common(1)[0]
+        if self.target_category in counts and len(counts) > 1:
+            rospy.logwarn(
+                '%s target classification conflicted across independent '
+                'windows: votes=%s; retrying another view',
+                label, dict(counts))
+            return False, None
+        if votes < required_votes:
+            rospy.logwarn(
+                '%s independent classification inconclusive: votes=%s '
+                'required=%d',
+                label, dict(counts), required_votes)
+            return False, None
+        winner = next(
+            item for item in reversed(detections) if item[0] == category)
+        rospy.loginfo(
+            '%s independent classification accepted: category=%s votes=%d/%d',
+            label, category, votes,
+            self.search_target_confirmations + 1)
+        return True, winner
 
     def _point_in_frame(self, pose, target_frame):
         point = PointStamped()
@@ -881,22 +1053,81 @@ class PickPlaceExecutor:
         rospy.logwarn('%s navigation failed', label)
         return False
 
+    def _direct_search_move(self, x, y, label):
+        base_x, base_y, hold_yaw = self._base_pose_map()
+        distance = math.hypot(x - base_x, y - base_y)
+        if distance > self.search_direct_max_distance:
+            rospy.loginfo(
+                '%s is %.3f m away; keeping move_base for this transition',
+                label, distance)
+            return None
+
+        self.nav_client.cancel_all_goals()
+        self._set_state('DIRECT_SEARCH_MOVE')
+        deadline = time.monotonic() + self.search_direct_timeout
+        period = 1.0 / self.fine_align_rate
+        try:
+            while not rospy.is_shutdown() and time.monotonic() < deadline:
+                base_x, base_y, base_yaw = self._base_pose_map()
+                error_map_x = x - base_x
+                error_map_y = y - base_y
+                error_xy = math.hypot(error_map_x, error_map_y)
+                yaw_error = self._wrap_angle(hold_yaw - base_yaw)
+                if (error_xy <= self.align_xy_tolerance
+                        and abs(yaw_error)
+                        <= self.fine_align_yaw_tolerance):
+                    rospy.loginfo(
+                        '%s direct move reached: xy_error=%.3f yaw_error=%.3f',
+                        label, error_xy, yaw_error)
+                    return True
+
+                cos_yaw = math.cos(base_yaw)
+                sin_yaw = math.sin(base_yaw)
+                command = Twist()
+                command.linear.x = self._clamp(
+                    self.fine_align_linear_gain * (
+                        cos_yaw * error_map_x + sin_yaw * error_map_y),
+                    self.search_direct_max_linear_speed)
+                command.linear.y = self._clamp(
+                    self.fine_align_linear_gain * (
+                        -sin_yaw * error_map_x + cos_yaw * error_map_y),
+                    self.search_direct_max_linear_speed)
+                command.angular.z = self._clamp(
+                    self.fine_align_angular_gain * yaw_error,
+                    self.search_direct_max_angular_speed)
+                self.cmd_vel_pub.publish(command)
+                time.sleep(period)
+        finally:
+            self._stop_base()
+
+        rospy.logwarn('%s direct move timed out', label)
+        return False
+
     def _rotate_search_at_pose(self, waypoint):
         search_x = float(waypoint['x'])
         search_y = float(waypoint['y'])
         search_yaw = float(waypoint['yaw'])
         label = 'coarse search'
+        started = time.monotonic()
         if not self._navigate(search_x, search_y, search_yaw, label, retries=0):
+            self._log_timing('search.coarse.navigation', started, 'failed')
             rospy.logwarn('%s navigation failed; trying fixed area searches', label)
             return None
+        self._log_timing('search.coarse.navigation', started)
         self._stop_base()
+        started = time.monotonic()
         time.sleep(self.search_settle_time)
+        self._log_timing('search.coarse.settle', started)
+        started = time.monotonic()
         self._move_arm('observe')
+        self._log_timing('search.coarse.observe_arm', started)
         since_received = self.vision_pose_received
         pose = self._current_detection(since_received)
         if pose is not None:
             self._stop_base()
+            started = time.monotonic()
             fresh_pose = self._reset_vision_and_observe()
+            self._log_timing('search.coarse.stationary_confirm', started)
             if fresh_pose is not None:
                 return fresh_pose
             rospy.logwarn('fresh stationary target pose unavailable at %s', label)
@@ -908,6 +1139,7 @@ class PickPlaceExecutor:
             'move_base collision checking is bypassed')
         start_x, start_y, previous_yaw = self._base_pose_odom()
         accumulated_yaw = 0.0
+        rotation_started = time.monotonic()
         deadline = time.monotonic() + self.search_rotation_timeout
         command = Twist()
         command.angular.z = self.search_rotation_speed
@@ -933,6 +1165,10 @@ class PickPlaceExecutor:
                     category, pose = detection
                     if category == self.target_category:
                         self._stop_base()
+                        self._log_timing(
+                            'search.coarse.rotation', rotation_started,
+                            'target category={} angle={:.2f}'.format(
+                                category, accumulated_yaw))
                         self._set_state('CONFIRM_CUBE')
                         self.detected_category_pub.publish(String(data=category))
                         rospy.loginfo(
@@ -943,9 +1179,13 @@ class PickPlaceExecutor:
                         return pose
                     if not self._is_seen_non_target(category, pose):
                         self._stop_base()
+                        confirm_started = time.monotonic()
                         self._set_state('CONFIRM_CUBE')
                         self._record_non_target(category, pose)
                         time.sleep(self.search_settle_time)
+                        self._log_timing(
+                            'search.coarse.non_target_confirm',
+                            confirm_started, 'category=' + category)
                         _, _, previous_yaw = self._base_pose_odom()
                         self._set_state('ROTATE_SEARCH')
 
@@ -954,7 +1194,12 @@ class PickPlaceExecutor:
         finally:
             self._stop_base()
 
+        self._log_timing(
+            'search.coarse.rotation', rotation_started,
+            'no_target angle={:.2f}'.format(accumulated_yaw))
+        started = time.monotonic()
         self._move_arm('navigation')
+        self._log_timing('search.coarse.raise_arm', started)
         if rospy.is_shutdown():
             raise RuntimeError('search rotation interrupted by shutdown')
         rospy.loginfo('%s completed without target; continuing search', label)
@@ -963,27 +1208,140 @@ class PickPlaceExecutor:
     def _search_area_waypoint(self, waypoint, index):
         area = str(waypoint['area'])
         label = 'area search {} ({})'.format(index, area)
-        if not self._navigate(
-                float(waypoint['x']), float(waypoint['y']),
-                float(waypoint['yaw']), label, retries=0):
-            rospy.logwarn('%s navigation failed; trying next area', label)
+        target_x = float(waypoint['x'])
+        target_y = float(waypoint['y'])
+        target_yaw = float(waypoint['yaw'])
+        started = time.monotonic()
+        moved = self._direct_search_move(
+            target_x, target_y, label)
+        move_mode = 'direct'
+        if moved is None:
+            move_mode = 'move_base'
+            moved = self._navigate(
+                target_x, target_y, target_yaw, label, retries=0)
+        if not moved:
+            self._log_timing(
+                'search.{}.move'.format(area), started,
+                'mode={} failed'.format(move_mode))
+            rospy.logwarn('%s move failed; trying next area', label)
             return None
+        self._log_timing(
+            'search.{}.move'.format(area), started, 'mode=' + move_mode)
 
         self._stop_base()
+        started = time.monotonic()
         time.sleep(self.search_settle_time)
-        self._move_arm('observe')
-        since_received = self.vision_pose_received
-        try:
-            self.vision_reset()
-        except rospy.ServiceException as exc:
-            rospy.logwarn('vision reset failed at %s: %s', label, exc)
+        self._log_timing('search.{}.settle'.format(area), started)
+        started = time.monotonic()
+        joint1_offset = 0.0
+        if move_mode == 'direct':
+            _, _, actual_yaw = self._base_pose_map()
+            nominal_joint1 = self._read_arm_pose('observe')[0][0]
+            yaw_delta = target_yaw - actual_yaw
+            candidates = [yaw_delta + 2.0 * math.pi * turns
+                          for turns in (-1, 0, 1)]
+            valid_offsets = [offset for offset in candidates
+                             if -3.14 <= nominal_joint1 + offset <= 3.14]
+            if not valid_offsets:
+                raise RuntimeError(
+                    '{} has no observe joint1 compensation within limits'.format(
+                        label))
+            joint1_offset = min(valid_offsets, key=abs)
+            rospy.loginfo(
+                '%s keeping base yaw; observe joint1 compensation=%.3f rad',
+                label, joint1_offset)
+        detection = None
+        non_target_detection = None
+        non_target_conflict = False
+        view_offsets = [0.0] + self.area_search_pan_offsets
+        for view_index, pan_offset in enumerate(view_offsets):
+            view_joint1_offset = joint1_offset + pan_offset
+            nominal_joint1 = self._read_arm_pose('observe')[0][0]
+            if not -3.14 <= nominal_joint1 + view_joint1_offset <= 3.14:
+                rospy.logwarn(
+                    '%s skipping pan offset %.3f outside joint1 limits',
+                    label, pan_offset)
+                continue
 
-        self._set_state('OBSERVE_' + area.upper())
-        detection = self._fresh_known_detection(
-            since_received, self.area_search_timeout)
+            started = time.monotonic()
+            self._move_arm('observe', joint1_offset=view_joint1_offset)
+            self._log_timing(
+                'search.{}.observe_arm'.format(area), started,
+                'view={} pan_offset={:.3f}'.format(view_index, pan_offset))
+            time.sleep(self.area_search_view_settle_time)
+            barrier_seq = self.vision_pose_seq
+            try:
+                self.vision_reset()
+            except rospy.ServiceException as exc:
+                rospy.logwarn('vision reset failed at %s: %s', label, exc)
+
+            self._set_state('OBSERVE_' + area.upper())
+            started = time.monotonic()
+            timeout = (self.area_search_timeout if view_index == 0
+                       else self.area_search_pan_timeout)
+            detection = self._fresh_search_detection(barrier_seq, timeout)
+            self._log_timing(
+                'search.{}.detection'.format(area), started,
+                'view={} pan_offset={:.3f} detected={}'.format(
+                    view_index, pan_offset, detection is not None))
+            if detection is not None:
+                confirmed, confirmed_detection = \
+                    self._confirm_search_target(detection, label)
+                if not confirmed:
+                    detection = None
+                else:
+                    detection = confirmed_detection
+                if (detection is not None
+                        and detection[0] == self.target_category):
+                    seen_category = self._seen_category_at_pose(detection[1])
+                    if (seen_category is not None
+                            and seen_category != self.target_category):
+                        rospy.logwarn(
+                            '%s rejected category flip at known %s cube pose',
+                            label, seen_category)
+                        detection = None
+                    elif (non_target_detection is not None
+                          and non_target_detection[0] != detection[0]
+                          and self._detections_share_pose(
+                              non_target_detection, detection)):
+                        rospy.logwarn(
+                            '%s rejected category flip at the same pose: '
+                            '%s -> %s', label, non_target_detection[0],
+                            detection[0])
+                        non_target_conflict = True
+                        detection = None
+                    else:
+                        break
+                elif detection is not None:
+                    if (non_target_detection is not None
+                            and non_target_detection[0] != detection[0]
+                            and self._detections_share_pose(
+                                non_target_detection, detection)):
+                        non_target_conflict = True
+                    non_target_detection = detection
+                    rospy.loginfo(
+                        '%s view %d saw non-target %s; completing remaining '
+                        'stationary views for target %s',
+                        label, view_index, detection[0], self.target_category)
+                    detection = None
+            if view_index + 1 < len(view_offsets):
+                rospy.loginfo(
+                    '%s center/corner view missed; trying stationary pan '
+                    'offset %.3f rad',
+                    label, view_offsets[view_index + 1])
+
         self._stop_base()
         if detection is None:
-            rospy.loginfo('%s completed without a cube', label)
+            detection = (None if non_target_conflict
+                         else non_target_detection)
+        if non_target_conflict:
+            rospy.logwarn(
+                '%s stationary views disagreed on non-target category; '
+                'leaving area unclassified', label)
+        if detection is None:
+            rospy.loginfo(
+                '%s completed without a cube after %d stationary views',
+                label, len(view_offsets))
             self._move_arm('navigation')
             return None
 
@@ -1004,15 +1362,28 @@ class PickPlaceExecutor:
 
     def _search(self):
         self._set_state('SEARCH_SOURCE')
+        started = time.monotonic()
         pose = self._rotate_search_at_pose(self.coarse_search_pose)
         if pose is not None:
+            self._log_timing('search.total', started, 'source=coarse')
             return pose
-        for index, waypoint in enumerate(self.area_search_waypoints):
-            pose = self._search_area_waypoint(waypoint, index)
-            if pose is not None:
-                return pose
+        for search_pass in range(self.area_search_passes):
+            if search_pass:
+                self._set_state('RETRY_AREA_SEARCH')
+                rospy.logwarn(
+                    'target missed in all fixed areas; starting stationary '
+                    'area search pass %d/%d',
+                    search_pass + 1, self.area_search_passes)
+            for index, waypoint in enumerate(self.area_search_waypoints):
+                pose = self._search_area_waypoint(waypoint, index)
+                if pose is not None:
+                    self._log_timing(
+                        'search.total', started,
+                        'source={} pass={}'.format(
+                            waypoint['area'], search_pass + 1))
+                    return pose
         raise RuntimeError(
-            'target was not detected by coarse or fixed area searches')
+            'target was not detected by coarse or repeated fixed area searches')
 
     @staticmethod
     def _clamp(value, limit):
@@ -1165,16 +1536,102 @@ class PickPlaceExecutor:
 
     def _prepare_stationary_grasp(self):
         self._set_state('PREPARE_GRASP')
+        prepare_started = time.monotonic()
+        started = time.monotonic()
         self._move_arm('grasp')
+        self._log_timing('grasp.prepare.arm', started)
+        started = time.monotonic()
         deadline = time.monotonic() + 3.0
         while not rospy.is_shutdown() and time.monotonic() < deadline:
             if (self.ready and self.attach_offset is not None
                     and max(abs(value) for value in self.attach_offset)
                     <= self.max_grasp_offset):
+                self._log_timing(
+                    'grasp.prepare.ready_offset', started,
+                    'ready={} offset={}'.format(
+                        self.ready, self.attach_offset))
+                self._log_timing('grasp.prepare.total', prepare_started)
                 return
             rospy.sleep(0.05)
-        raise RuntimeError(
-            'object is not stably inside the conservative tcp grasp box')
+        raise GraspPreparationError(
+            'object is not stably inside the conservative tcp grasp box: '
+            'ready={} offset={}'.format(self.ready, self.attach_offset))
+
+    def _grasp_retry_pose_from_offset(self, previous_pose):
+        if self.attach_offset is None:
+            return None
+        if not all(math.isfinite(value) for value in self.attach_offset):
+            return None
+
+        offset_point = PointStamped()
+        offset_point.header.frame_id = 'tcp_link'
+        offset_point.header.stamp = rospy.Time(0)
+        offset_point.point.x = self.attach_offset[0]
+        offset_point.point.y = self.attach_offset[1]
+        offset_point.point.z = self.attach_offset[2]
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'map', 'tcp_link', rospy.Time(0), rospy.Duration(0.5))
+            target = tf2_geometry_msgs.do_transform_point(
+                offset_point, transform)
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as exc:
+            rospy.logwarn('grasp retry offset TF unavailable: %s', exc)
+            return None
+
+        previous = self._point_in_frame(previous_pose, 'map').point
+        shift = math.hypot(
+            target.point.x - previous.x, target.point.y - previous.y)
+        if shift > self.grasp_retry_max_target_shift:
+            rospy.logwarn(
+                'rejecting grasp retry offset target %.3f m from the last '
+                'visual target', shift)
+            return None
+
+        pose = PoseStamped()
+        pose.header.frame_id = 'map'
+        pose.header.stamp = rospy.Time(0)
+        pose.pose.position = target.point
+        pose.pose.orientation.w = 1.0
+        rospy.logwarn(
+            'using grasp offset fallback for retry: shift=%.3f m '
+            'map=(%.3f, %.3f) offset=%s',
+            shift, target.point.x, target.point.y, self.attach_offset)
+        return pose
+
+    def _retry_grasp_pose(self, previous_pose):
+        # Capture the backend-derived target while the arm is still in the
+        # failed grasp posture. Raising the arm changes tcp_link geometry.
+        offset_pose = self._grasp_retry_pose_from_offset(previous_pose)
+        observed_pose = self._reset_vision_and_observe()
+        if observed_pose is not None:
+            rospy.loginfo('fresh visual target acquired for grasp retry')
+            return observed_pose
+        return offset_pose
+
+    def _align_prepare_and_grasp(self, first_pose):
+        target_pose = first_pose
+        for attempt in range(self.grasp_prepare_retries + 1):
+            if attempt:
+                self._set_state('RETRY_GRASP_ALIGN')
+                rospy.logwarn(
+                    'retrying grasp alignment %d/%d',
+                    attempt, self.grasp_prepare_retries)
+            self._align_to_grasp(target_pose)
+            try:
+                self._prepare_stationary_grasp()
+            except GraspPreparationError as exc:
+                if attempt >= self.grasp_prepare_retries:
+                    raise
+                rospy.logwarn('grasp preparation failed: %s', exc)
+                retry_pose = self._retry_grasp_pose(target_pose)
+                if retry_pose is None:
+                    raise GraspPreparationError(
+                        '{}; no fresh retry target available'.format(exc))
+                target_pose = retry_pose
+                continue
+            self._grasp()
+            return
 
     def _wait_attach(self):
         expected = self.category_to_model[self.target_category]
@@ -1192,17 +1649,56 @@ class PickPlaceExecutor:
         if self.grasp_state != 'GRASPING' or self.attached_model != expected:
             raise RuntimeError('attachment lost during transport')
 
+    def _refresh_costmaps_after_pickup(self):
+        """Remove the picked cube's stale laser obstacle before transport."""
+        global_updates = self._global_costmap_updates
+        local_updates = self._local_costmap_updates
+        try:
+            self.clear_costmaps()
+        except rospy.ServiceException as exc:
+            raise RuntimeError(
+                'costmap reset after pickup failed: {}'.format(exc))
+
+        deadline = time.monotonic() + self.navigation_data_timeout
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            self._check_attachment()
+            if (self._global_costmap_updates > global_updates
+                    and self._local_costmap_updates > local_updates):
+                rospy.loginfo(
+                    'costmaps refreshed after pickup: global_updates=%d '
+                    'local_updates=%d',
+                    self._global_costmap_updates - global_updates,
+                    self._local_costmap_updates - local_updates)
+                return
+            time.sleep(0.05)
+        rospy.logwarn(
+            'costmap reset completed after pickup, but fresh published '
+            'global/local costmaps were not both observed before timeout')
+
     def _grasp(self):
         self._set_state('GRASP')
+        grasp_started = time.monotonic()
         # _prepare_stationary_grasp has already positioned the arm while the
         # base is stopped; only the gripper moves in this state.
         if not self.ready:
             raise RuntimeError('object is not inside the tcp grasp box')
-        self._command_gripper(self.gripper_close, 'close')
+        started = time.monotonic()
+        self._command_gripper(
+            self.gripper_close, 'close', attachment_satisfies=True)
+        self._log_timing('grasp.close', started)
+        started = time.monotonic()
         self._wait_attach()
+        self._log_timing(
+            'grasp.attach_confirm', started,
+            'state={} model={}'.format(
+                self.grasp_state, self.attached_model))
         # grasp_attach echoes the threshold-crossing joint position back to
         # the controller; reassert the configured close target for transport.
-        self._command_gripper(self.gripper_close, 'hold')
+        started = time.monotonic()
+        self._command_gripper(
+            self.gripper_close, 'hold', attachment_satisfies=True)
+        self._log_timing('grasp.hold', started)
+        self._log_timing('grasp.total', grasp_started)
 
     def _parking_footprint_inside(self, x, y, yaw, area):
         cos_yaw = math.cos(yaw)
@@ -1258,10 +1754,12 @@ class PickPlaceExecutor:
         raise RuntimeError('vehicle footprint did not settle inside parking area')
 
     def _navigate_to_parking(self):
-        self._set_state('NAVIGATE_TO_PARKING')
+        self._set_state('PREPARE_TRANSPORT')
         # Keep the attached object in the raised transport posture throughout.
         self._move_arm('transport')
         self._check_attachment()
+        self._refresh_costmaps_after_pickup()
+        self._set_state('NAVIGATE_TO_PARKING')
         area = self.parking_areas[self.target_category]
         target_x = 0.5 * (float(area['x_min']) + float(area['x_max']))
         target_y = 0.5 * (float(area['y_min']) + float(area['y_max']))
@@ -1319,9 +1817,7 @@ class PickPlaceExecutor:
         # and must not delay the initial navigation.
         detection = self._search()
         self._measure_arm_geometry()
-        self._align_to_grasp(detection)
-        self._prepare_stationary_grasp()
-        self._grasp()
+        self._align_prepare_and_grasp(detection)
         self._navigate_to_parking()
         self._set_state('SUCCESS')
         rospy.set_param('/gazebo_success', 1)

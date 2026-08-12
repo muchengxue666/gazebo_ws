@@ -58,15 +58,21 @@ arm_timeout: 8.0
 nav_timeout: 45.0
 server_wait_timeout: 60.0
 navigation_ready_timeout: 60.0
-navigation_startup_delay: 10.0
 navigation_stable_time: 3.0
 navigation_pose_tolerance: 0.03
 navigation_data_timeout: 2.5
 navigation_min_costmap_updates: 3
 attach_timeout: 5.0
+# A failed conservative-box check happens before the gripper closes, so it is
+# safe to reacquire/re-align a bounded number of times instead of exiting.
+grasp_prepare_retries: 2
+grasp_retry_max_target_shift: 0.12
 nav_retries: 1
-max_align_iterations: 3
-max_align_step: 0.15
+# Normally navigate directly from the search pose to the estimated grasp pose.
+# Keep one additional coarse correction only when the fresh observation still
+# lies outside the bounded 8 cm /cmd_vel fine-alignment region.
+max_align_iterations: 2
+max_align_step: 1.0
 align_xy_tolerance: 0.012
 # Last 8 cm use bounded low-speed /cmd_vel feedback; move_base handles the
 # preceding coarse alignment.
@@ -98,14 +104,32 @@ area_search_waypoints:
   - {area: area_b, x: -1.40, y: -0.40, yaw: 0.0}
   - {area: area_c, x: -1.20, y: -0.53, yaw: -1.5708}
 area_search_timeout: 6.0
+# Keep the vehicle parked and pan only arm_joint1 when a cube lies near a
+# camera-image corner. These offsets are relative to the area's center view.
+area_search_pan_offsets: [0.45, -0.45]
+area_search_pan_timeout: 4.0
+# Let Gazebo camera queues drain after each arm pan before resetting votes.
+area_search_view_settle_time: 0.8
+# Retry the complete stationary A/B/C search once before declaring failure.
+area_search_passes: 2
+# A target candidate must survive independent vote resets at the same pose.
+search_target_confirmations: 2
+search_target_confirm_timeout: 4.0
+search_target_confirm_distance: 0.05
 # The coarse direct rotation bypasses move_base collision checking because
 # the lowered observe arm blocks raw /scan.
 search_settle_time: 0.5
-search_rotation_speed: -0.20
+search_rotation_speed: -0.25
 search_rotation_angle: 6.283185
 search_rotation_timeout: 40.0
 search_rotation_rate: 20.0
 search_rotation_max_drift: 0.08
+# Once coarse navigation reaches the obstacle-free search zone, use bounded
+# map-TF feedback instead of invoking move_base for these short transitions.
+search_direct_max_distance: 0.30
+search_direct_timeout: 10.0
+search_direct_max_linear_speed: 0.15
+search_direct_max_angular_speed: 0.50
 # Spatial tolerance used to avoid stopping repeatedly on one non-target cube.
 search_detection_dedupe_distance: 0.05
 # The vehicle, not the cube, must fit completely inside the marked workshop.

@@ -118,6 +118,7 @@ class CubeVision:
         self.history = collections.deque(maxlen=self.stability_samples)
         self.category_history = collections.deque(maxlen=self.stability_samples)
         self.unknown_frames = 0
+        self.pose_unknown_frames = 0
         self.last_process_time = rospy.Time(0)
         self.last_diagnostic_time = rospy.Time(0)
         self.last_candidate_diagnostics = {}
@@ -148,6 +149,7 @@ class CubeVision:
         self.history.clear()
         self.category_history.clear()
         self.unknown_frames = 0
+        self.pose_unknown_frames = 0
         return EmptyResponse()
 
     @staticmethod
@@ -257,16 +259,17 @@ class CubeVision:
                         self.pose_pub.publish(stable[2])
                     self._publish_debug(debug, rgb_msg)
                     return
-            self.history.clear()
+            self._record_pose_unknown_frame()
             self._publish_debug(debug, rgb_msg)
             return
 
         pose = self._candidate_pose(best, depth_msg.header)
         if pose is None:
-            self.history.clear()
+            self._record_pose_unknown_frame()
             self._publish_debug(debug, rgb_msg)
             return
 
+        self.pose_unknown_frames = 0
         self.history.append((best['category'], best['score'], pose))
         stable = self._stable_result()
         if stable is not None:
@@ -424,6 +427,12 @@ class CubeVision:
         if self.unknown_frames > self.max_unknown_frames:
             self.history.clear()
             self.category_history.clear()
+            self.pose_unknown_frames = 0
+
+    def _record_pose_unknown_frame(self):
+        self.pose_unknown_frames += 1
+        if self.pose_unknown_frames > self.max_unknown_frames:
+            self.history.clear()
 
     def _publish_unknown(self, confidence):
         self.category_pub.publish(String(data='unknown'))

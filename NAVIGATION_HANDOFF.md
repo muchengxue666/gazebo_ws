@@ -18,6 +18,8 @@
 - 深度话题 `/depth_camera/depth/image_raw` 在 Gazebo 中交替出现 `rgb8` 和 `32FC1`；当前视觉节点仅过滤并使用 `32FC1`/`16UC1`/`mono16` 深度帧，未修改 URDF；
 - 当前第一阶段只处理单个 `food -> cube_0` 物块；随机刷新时类别与区域不固定，测试 A 区时不能假设目标是 `cube_0`；
 - daily 投放区域尚未确认，不能直接启用。
+- TCP/ROS 双向桥接已完成通信测试：本机作为客户端连接 `192.168.10.246:9000`，桥接 `/cube_category` 话题和 `/gazebo_success` 参数；TCP 已不再是当前阻塞项。
+- 下一阶段主线改为任务耗时优化，优先处理“搜索物块”和“确认夹取”两个阶段；当前尚未记录分阶段耗时基线，不能先凭感觉缩短超时。
 
 必须保持不变的规则或既有实验文件：
 
@@ -156,7 +158,8 @@ src/car3/launch/nav_pick_place_task.launch
 
 1. `gazebo_nav/launch/static_nav_sim.launch`；
 2. 既有视觉节点 `cube_vision.py`；
-3. 新任务执行器 `pick_place_executor.py`。
+3. 新任务执行器 `pick_place_executor.py`；
+4. 默认启用的 TCP/ROS 桥接节点 `tcp_ros_bridge.py`。
 
 注意：launch 文件中的书写顺序不代表导航栈完全启动后才启动执行器。Gazebo、控制器、AMCL、move_base、视觉和执行器会并发初始化，因此执行器内部仍包含 action server 和导航数据等待。
 
@@ -180,6 +183,9 @@ roslaunch car3 nav_pick_place_task.launch \
 start_task=true            启动自动状态机
 arm_poses_verified=true    允许执行机械臂姿态；仅表示人工确认后放行
 target_category=food       第一阶段目标类别
+tcp_bridge=true            启动 TCP/ROS 桥接，当前默认开启
+tcp_remote_host=192.168.10.246
+tcp_remote_port=9000
 ```
 
 夹爪参数：
@@ -391,6 +397,7 @@ rosnode list
 ```text
 /cube_vision
 /pick_place_executor
+/tcp_ros_bridge
 ```
 
 检查规划器：
@@ -460,7 +467,15 @@ RobotModel
 
 ## 9. 已知限制与后续工作
 
-下一阶段应按以下顺序继续，不要同时修改导航和抓取：
+下一轮当前主线是速度优化，应按以下顺序进行：
+
+1. 给状态切换增加耗时记录，至少分别统计 `SEARCH_SOURCE/ROTATE_SEARCH/CONFIRM_CUBE` 和 `PREPARE_GRASP/GRASP`；先跑出基线，再改参数或逻辑；
+2. 优先优化搜索物块阶段：区分 waypoint 导航、`search_settle_time`、机械臂切换、旋转扫描、`area_search_timeout` 和类别确认各自耗时；继续保持“首个点发现目标后立即跳过剩余 waypoint”；
+3. 再优化确认夹取阶段：区分 fresh Pose、机械臂进入 `grasp`、`grasp_attach/ready`、夹爪闭合、`attached_model` 确认和闭合保持各自耗时；
+4. 每次只修改一类等待或动作参数，并用相同启动条件重复测试，确认提速没有引入漏检、误抓、附着失败或物块丢失；
+5. 超时参数只是失败上限；对于已经满足条件就提前返回的等待，单纯缩短超时不会加快成功路径，必须以分阶段日志定位真实等待点。
+
+仍需保留的功能验证 backlog：
 
 1. 在 B/C 区和多个静止视角重复校准脚本，确认视觉 XY 误差和高度误差；
 2. 在目标可见的运行中复测 `FINE_ALIGN_TO_GRASP`：进入约 8 cm 后只能发布受限 `/cmd_vel`（当前线速度上限 `0.04 m/s`、角速度上限 `0.30 rad/s`），确认 XY/yaw 都收敛到阈值；
@@ -498,6 +513,7 @@ RobotModel
 - arm-down 停车、抬臂后导航的任务约束。
 - Gazebo A 区视觉坐标校准：`cube_0` 的 map 真值约 `(-1.9643,-0.3937,0.0104)`，视觉稳定输出约 `(-1.9650,-0.3959,0.0077)`，XY 误差 `2.4 mm`、Z 误差 `-2.7 mm`；
 - 视觉校准脚本已修复并可运行：`src/car3/scripts/calibrate_vision_ground_truth.py`。
+- TCP client 已能连接 `192.168.10.246:9000`，TCP/ROS 桥接通信测试已由用户确认通过。
 
 尚未完成：
 
@@ -511,3 +527,471 @@ RobotModel
 - 投放与释放验证；
 - daily 区域确认；
 - 三类物块完整闭环。
+
+---
+
+## 11. TCP/ROS 桥接交接
+
+### 11.1 当前实现
+
+脚本：
+
+```text
+src/car3/scripts/tcp_ros_bridge.py
+```
+
+安装配置已加入：
+
+```text
+src/car3/CMakeLists.txt
+```
+
+启动配置已加入：
+
+```text
+src/car3/launch/nav_pick_place_task.launch
+```
+
+通信方向和角色：
+
+```text
+本机 gazebo_ws：TCP client
+远端 192.168.10.246：必须运行 TCP server
+默认端口：9000
+协议：UTF-8 JSON Lines，每条 JSON 后必须有换行符 \n
+```
+
+双向桥接对象：
+
+```text
+/cube_category   std_msgs/String 话题
+/gazebo_success  ROS 参数
+```
+
+远端可发送以下消息来更新本机 ROS：
+
+```json
+{"type":"cube_category","value":"food"}
+{"type":"gazebo_success","value":1}
+```
+
+本机向远端发送的消息还会分别包含 `topic` 或 `param` 字段；远端应按 `type` 和 `value` 处理，并忽略不需要的额外字段。
+
+### 11.2 当前同步语义
+
+- `/gazebo_success` 默认每 `0.2 s` 检查一次，启动时发送当前值；参数不存在时按 `0` 处理；
+- 后续只有参数值变化时才发送，不是周期心跳；
+- 收到远端 `gazebo_success` 消息后会设置本机 `/gazebo_success`；
+- TCP 断线后默认每 `2 s` 自动重连；断线期间检测到的本地变化暂存在最多 100 条的发送队列中；
+- 每次重连成功后不会无条件重发当前 `/gazebo_success`，也没有 ACK/失败重传，因此目前不能声称是强可靠状态同步；
+- `/cube_category` 收发均已实现，并带有简单的本机回环抑制。
+
+如果下一阶段要求远端重启后必然得到最新状态，最小修改应是：每次 TCP 连接成功时主动发送一次当前 `/gazebo_success`。是否还需要周期心跳或应用层 ACK，应由对端协议要求决定，不要先行增加。
+
+### 11.3 联调结果
+
+当前状态：
+
+```text
+本机：192.168.10.217/24，接口 wlp2s0
+目标：192.168.10.246
+TCP 192.168.10.246:9000：通信测试通过
+```
+
+此前曾出现 `Connection refused`，当时目标主机可 ping，但 `9000` 没有可用监听服务。该问题现已排除，不再是当前阻塞项。远端具体修复动作和本轮测试报文未记录，因此不要在交接文档中推断其防火墙或服务配置。
+
+如后续再次无法连接，先检查远端监听：
+
+```bash
+ss -ltnp | grep ':9000'
+```
+
+TCP server 应监听 `0.0.0.0:9000` 或 `192.168.10.246:9000`，不能只监听 `127.0.0.1:9000`。如果实际端口不是 9000，启动时传入：
+
+```bash
+roslaunch car3 nav_pick_place_task.launch \
+  tcp_bridge:=true \
+  tcp_remote_host:=192.168.10.246 \
+  tcp_remote_port:=实际端口
+```
+
+本机可先验证端口：
+
+```bash
+nc -vz -w 3 192.168.10.246 9000
+```
+
+正常情况下任务日志应出现：
+
+```text
+TCP bridge connected
+```
+
+### 11.4 联调验收步骤
+
+本机到远端：
+
+```bash
+rostopic pub --once /cube_category std_msgs/String "data: 'food'"
+rosparam set /gazebo_success 1
+```
+
+远端应收到两条以换行分隔的 JSON 消息。
+
+远端到本机：
+
+```json
+{"type":"cube_category","value":"electronics"}
+{"type":"gazebo_success","value":0}
+```
+
+本机检查：
+
+```bash
+rostopic echo /cube_category
+rosparam get /gazebo_success
+```
+
+当前验证状态：
+
+- `tcp_ros_bridge.py` Python 语法检查通过；
+- launch XML 检查通过；
+- `car3` 单元测试 `3/3` 通过；
+- `catkin_make --pkg car3 -j2` 通过；
+- TCP 通信测试已由用户确认通过。
+
+TCP 当前进入回归保护状态，不作为下一轮优化重点。修改搜索或夹取逻辑后，仅需确认桥接节点仍能连接，并且 `/cube_category` 与 `/gazebo_success` 的既有通信没有回归。
+
+---
+
+## 12. 下一轮任务：搜索与夹取确认速度优化
+
+### 12.1 优化范围
+
+只优化以下两段：
+
+```text
+搜索物块：SEARCH_SOURCE -> ROTATE_SEARCH/OBSERVE_* -> CONFIRM_CUBE
+确认夹取：PREPARE_GRASP -> GRASP -> attached_model 确认
+```
+
+暂时不要同时调整 TEB、地图、视觉坐标模型、运输路线或投放逻辑。当前没有给出目标总耗时或期望提升比例，下一轮必须先测量基线，不能宣称已经提速。
+
+### 12.2 搜索阶段需要测量的节点
+
+```text
+到达每个 waypoint 的时间
+停车后的 search_settle_time（当前 0.5 s）
+navigation -> observe 的机械臂动作与稳定时间
+首帧有效检测和类别确认时间
+旋转搜索时间、旋转角度和是否发生非目标确认停顿
+空 waypoint 的 area_search_timeout（当前 6.0 s）
+首点命中时是否确实跳过后续 waypoint
+```
+
+搜索优化必须继续满足：目标一旦确认立即停车、发布零速度并停止后续 waypoint；`observe` 下的直接旋转仍受漂移、角度和超时限制，不能为了提速绕开现有安全归零逻辑。
+
+### 12.3 夹取确认阶段需要测量的节点
+
+```text
+fresh Pose 样本收集：默认 3 个样本、最长 3.0 s
+进入 grasp 姿态及关节稳定时间
+等待 grasp_attach/ready 和 attach_offset 进入阈值的时间
+夹爪 close 到到位的时间
+等待 GRASPING 且 attached_model 正确的时间（attach_timeout 当前 5.0 s）
+再次发送 hold 到到位的时间
+```
+
+`PREPARE_GRASP` 和 `_wait_attach()` 都会在条件满足时提前返回；只有实测发现有效事件到达慢、重复动作或固定等待占时，才修改对应逻辑。不得通过跳过 `ready`、`attach_offset`、`GRASPING` 或 `attached_model` 检查来换取速度。
+
+### 12.4 验收原则
+
+每次修改后至少记录：
+
+```text
+搜索阶段耗时
+确认夹取阶段耗时
+找到的 category
+attached_model
+最终 grasp_state
+是否进入后续 transport
+```
+
+验收必须同时满足：耗时相对基线下降；首点命中短路仍有效；目标类别正确；夹取确认成功；抬到 `transport` 后物块不丢失；失败路径仍会停车并给出明确日志。
+
+---
+
+## 13. 2026-08-11 搜索速度优化实测
+
+### 13.1 本轮修改
+
+`pick_place_executor.py` 增加 wall-clock 分阶段日志，记录：
+
+```text
+搜索：waypoint 导航、停车稳定、observe 动作、旋转/检测、非目标确认、总耗时
+夹取：grasp 动作、ready+attach_offset、夹爪 close、GRASPING+attached_model、hold、总耗时
+```
+
+最终只保留一个速度参数修改：
+
+```yaml
+search_rotation_speed: -0.20 -> -0.25
+```
+
+没有修改任何 timeout，也没有修改类别、ready、attach_offset、`GRASPING` 或 `attached_model` 检查。旋转的一周角度上限、漂移限制、超时和 `finally` 零速度逻辑保持不变。
+
+### 13.2 基线
+
+启动条件：
+
+```bash
+roslaunch car3 nav_pick_place_task.launch \
+  gui:=false rviz:=false spawn_dynamic_objects:=true \
+  arm_poses_verified:=true tcp_bridge:=false
+rostopic pub --once /cube_category std_msgs/String "data: 'food'"
+```
+
+物块仍由 `spawn_cubes.py` 随机刷新。基线中 `cube_0/food` 位于 A 区约 `(-1.975, -0.339)`；粗搜索首点命中，未访问后续固定 waypoint：
+
+```text
+search.coarse.navigation       29.552 s
+search.coarse.settle            0.500 s
+search.coarse.observe_arm       3.495 s
+search.coarse.rotation          2.369 s / 0.42 rad
+search.total                   35.928 s
+
+grasp.prepare.arm               3.371 s
+grasp.prepare.ready_offset      0.000 s
+grasp.prepare.total             3.373 s
+grasp.close                     0.728 s
+grasp.attach_confirm            0.220 s  (GRASPING, cube_0)
+grasp.hold                      0.000 s
+grasp.total                     0.955 s
+```
+
+该轮进入 `PARKED -> SUCCESS`，抬到 transport 并完成运输时附着未丢失。
+
+基线表明 `ready/attach_offset` 和 attach 确认都在条件满足后立即提前返回；缩短它们的 timeout 不会加快成功路径。粗搜索旋转则随扫描角度直接增加耗时，实测约 `5.64 s/rad`。
+
+### 13.3 优化结果
+
+最终复测使用相同 launch 参数并再次随机刷新；`cube_0/food` 位于 A 区约 `(-1.966, -0.371)`。结果：
+
+```text
+search.coarse.navigation       31.107 s
+search.coarse.settle            0.500 s
+search.coarse.observe_arm       3.484 s
+search.coarse.rotation          0.453 s / 0.10 rad
+search.total                   35.554 s
+
+grasp.prepare.arm               3.315 s
+grasp.prepare.ready_offset      0.000 s
+grasp.prepare.total             3.319 s
+grasp.close                     0.674 s
+grasp.attach_confirm            0.259 s  (GRASPING, cube_0)
+grasp.hold                      0.000 s
+grasp.total                     0.938 s
+```
+
+旋转归一化耗时约 `4.53 s/rad`，相对基线约下降 `19.7%`；由于日志角度仅保留两位小数，该百分比只作为本轮量级估计。尽管最终轮导航比基线多 `1.555 s`，搜索总耗时仍从 `35.928 s` 降到 `35.554 s`。目标确认后立即结束搜索，日志中没有任何 `OBSERVE_AREA_*`，证明没有继续后续 waypoint。最终类别为 `food`，attach 确认为 `GRASPING/cube_0`，并进入 `PARKED -> SUCCESS`，transport 后物块未丢失。
+
+另一次保持 `-0.20 rad/s` 的随机 C 区运行中，旋转先确认 `daily` 非目标，再在 `3.25 rad` 处确认 `food`，说明非目标类别检查和继续搜索逻辑仍工作。该轮曾试验把 grasp 轨迹从 `3.0 s` 改为 `2.0 s`；虽然 `PREPARE_GRASP` 降到 `2.926 s` 且 attach 成功，但进入 transport 后附着丢失，因此该试验不满足验收，已完全恢复为 `3.0 s`，不计作优化收益。
+
+### 13.4 验证与遗留问题
+
+已验证：
+
+- 标准入口为 `nav_pick_place_task.launch`，未使用旧 `gazebo_nav.launch`；
+- `math.world`、`spawn_cubes.py`、`grasp_attach.py` 未修改，随机坐标未写入任务代码；
+- 首点目标确认后跳过后续 waypoint；搜索旋转检测后由原有 `finally` 发布零速度；
+- 类别、fresh Pose 流程、ready、attach_offset、`GRASPING`、正确 `attached_model` 均保留；
+- 夹取后进入 transport、停车区域和 `SUCCESS`；
+- TCP 测速时关闭以隔离外部网络波动，桥接代码和接口未修改。
+
+遗留问题：当前 `-0.25 rad/s` 只完成一次完整成功复测；下一步应在随机 A/B/C 分布下重复运行，重点确认更长旋转角度时不漏检，并按角度统计多轮均值。C 区那次 transport 脱离发生在已撤销的 grasp 轨迹试验中，后端日志未给出独立原因；在再次尝试缩短 grasp 动作前，应先复现并定位脱离条件，不能继续直接压缩动作时长。
+
+---
+
+## 14. 2026-08-12 搜索区固定观察点直接移动
+
+本节记录第一版“底盘平移同时调整观察 yaw”的对照数据；最终实现已进一步改为“底盘保持 yaw 平移、机械臂 joint1 补偿观察方向”，以第 15 节为准。
+
+### 14.1 修改范围
+
+初始出生点到 `coarse_search_pose` 仍使用 `move_base`，因为“搜索区内部无障碍”不能推导出整条初始路线无障碍。只有已经到达粗搜索区后，A/B/C 固定观察点之间改用 map TF 闭环 `/cmd_vel`：
+
+```text
+最大直接移动距离：0.30 m
+线速度上限：0.15 m/s
+角速度上限：0.50 rad/s
+超时：10.0 s
+控制频率：沿用 fine_align_rate=20 Hz
+位置/yaw 验收：沿用 0.012 m / 0.04 rad
+```
+
+超过 `0.30 m` 时继续使用 `move_base`。直接移动前由既有状态机保证机械臂已经回到 `navigation`；移动采用实时 `map -> base_footprint` 误差闭环，而不是按固定时间盲走。正常到达、超时、TF/运行异常和 ROS shutdown 都经过 `finally` 发布零速度。
+
+### 14.2 move_base 基线与直接移动结果
+
+使用标准 `nav_pick_place_task.launch`、随机物块和同一组配置 waypoint。move_base 基线通过 `/move_base_simple/goal` 逐点发送并确认每次结果均为 `Goal reached`：
+
+```text
+转换             move_base       直接移动       节省
+coarse -> area_a   3.976 s         1.767 s       55.6%
+area_a -> area_b   9.077 s         5.744 s       36.7%
+area_b -> area_c   7.671 s         5.547 s       27.7%
+合计              20.724 s        13.058 s       37.0% / 7.666 s
+```
+
+直接移动终点日志：
+
+```text
+area_a: xy_error=0.012 m, yaw_error= 0.010 rad
+area_b: xy_error=0.000 m, yaw_error=-0.039 rad
+area_c: xy_error=0.002 m, yaw_error=-0.039 rad
+```
+
+为确定性覆盖三个 waypoint，验证运行临时将粗旋转角度设为 `0.01 rad`，并选择本轮随机位于 C 区的 `electronics/cube_2` 为目标。运行依次在 A 区确认 `food`、B 区确认 `daily`、C 区确认目标 `electronics`，随后 `search.total` 以 `source=area_c` 正常返回。测试后已将正式 `search_rotation_angle` 恢复为 `6.283185`，物块随机坐标未写入代码。
+
+### 14.3 保持不变与后续
+
+- 粗搜索初始导航、旋转搜索、目标首见短路、类别确认、视觉 reset 和每点 observe 流程不变；
+- 每次直接移动结束均停车，之后才执行 `search_settle_time` 和 observe；
+- 地图、生成脚本、attach 后端、导航配置、视觉、夹取和 TCP 均未修改；
+- 本轮验证的是搜索 waypoint 移动与分类链，没有重复执行其后的 C 区抓取运输；抓取运输状态仍以第 13 节成功运行作为当前基线。
+
+后续如果提高 `0.15 m/s` 或扩大 `0.30 m` 范围，必须重新检查路径净空和停车误差；不能把这种直接移动扩展到出生点到搜索区、运输路线或投放区域。
+
+---
+
+## 15. 2026-08-12 麦克纳姆纯平移与机械臂转向
+
+### 15.1 最终策略
+
+搜索区内不再让底盘转到每个 waypoint 的观察 yaw：
+
+```text
+底盘：保持进入搜索区时的 yaw，使用 linear.x + linear.y 闭环平移
+机械臂：到点后在原 3 s observe 动作中同时调整 arm_joint1
+观察方向：arm_joint1_offset = waypoint_yaw - actual_base_yaw（选择关节限位内的等价角）
+```
+
+底盘仍用小角速度闭环抵消 yaw 漂移，但目标是保持原朝向，不是转向 waypoint yaw。observe 的其余四个关节、动作时长、稳定检查、视觉 reset 和类别确认不变。距离超过 `0.30 m` 回退 move_base 时，底盘仍到达原 waypoint yaw，机械臂不加补偿。
+
+第一次验证在 C 区发现等价角选择问题：`+3.036 rad` 叠加 nominal joint1 后超出限位，运行被既有限位保护明确终止。随后改为从 `delta + {-2pi, 0, 2pi}` 中选择最终 joint1 位于 `[-3.14, 3.14]` 的最小绝对补偿；C 区选到 `-3.263 rad`，最终 joint1 约 `-1.69 rad`，动作与视觉确认成功。失败版本未保留。
+
+### 15.2 最终耗时
+
+同样通过临时 `search_rotation_angle=0.01` 确定性覆盖 A/B/C；测试后已恢复正式值 `6.283185`：
+
+```text
+转换             move_base    底盘边移边转    纯平移+机械臂转向
+coarse -> area_a   3.976 s       1.767 s          1.816 s
+area_a -> area_b   9.077 s       5.744 s          1.716 s
+area_b -> area_c   7.671 s       5.547 s          3.580 s
+合计              20.724 s      13.058 s          7.112 s
+```
+
+最终策略相对 move_base 节省 `13.612 s / 65.7%`，相对底盘边移边转再节省 `5.946 s / 45.5%`。三段结束时底盘 yaw 保持误差日志均约为 `0.000 rad`，XY 误差分别为 `0.012/0.012/0.012 m`。
+
+机械臂补偿与视觉结果：
+
+```text
+area_a joint1_offset= 0.027 rad -> 确认 electronics 非目标
+area_b joint1_offset=-1.693 rad -> 本轮 6 s 内无检测
+area_c joint1_offset=-3.263 rad -> 确认 food 目标，source=area_c
+```
+
+此前一次相同方向补偿运行中，A/B 分别正确确认 `food/electronics`；因此三个区域都已分别出现正确识别，但还没有一轮在随机边缘位置同时命中 A/B/C。本轮 B 区物块位于区域边缘附近且未检出，需作为视觉覆盖回归项继续重复随机测试，不能把单轮搜索总耗时当作最终均值。
+
+---
+
+## 16. 2026-08-12 固定搜索确认与夹爪阈值复测
+
+固定区域搜索现在对每个候选执行两个额外视觉 reset；初始窗口加两个确认窗口中，类别至少需要两票。若目标类别与任一其他类别在这些独立窗口中冲突，则不允许用 `2:1` 开始抓取，而是继续下一视角。不同机械臂视角在 5 cm 内看到同一 Pose 却给出不同类别时也判为冲突。实测曾出现 B 区同一 daily 物块跨视角翻为 electronics；该保护阻止了错误抓取。
+
+干净随机复测中物块分布为 A 区 daily、B 区 electronics、C 区 food。临时把粗旋转限制为 `0.01 rad` 后，任务在 A 区拒绝了无法独立复现的单次候选，在 B 区以 `3/3` 确认 electronics 非目标，最后在 C 区中心静止视角约 `1.2 s` 找到 food 并以 `3/3` 确认。正式 YAML 的完整粗旋转参数未修改。
+
+夹爪实测表明，发送 `0.8` 后物块接触会使 `r_joint` 停在约 `0.8402`。因此 attach 后端的 launch 参数使用 `close_threshold=0.86`；该次手动验证得到：
+
+```text
+/grasp_attach/ready: true
+/grasp_attach/state: GRASPING
+/grasp_attach/attached_model: cube_0
+r_joint: 0.8402
+```
+
+原 `open_threshold=0.89` 会在机械臂抬升时因关节瞬态波动误释放，表现为物块夹到半空掉落。任务要求抓取后不放下，因此 launch 将释放阈值设为 `1.2`，只让显式 `1.5` 打开命令释放。执行器关闭/保持夹爪时也允许已经进入 `GRASPING` 作为关节等待完成条件，随后仍严格校验目标类别对应的 `attached_model`；transport 抬升后和停车完成后继续调用 `_check_attachment()`。
+
+---
+
+## 17. UDP/ROS 桥接
+
+脚本 `src/car3/scripts/udp_ros_bridge.py` 提供与 TCP 桥相同的双向同步对象：
+
+```text
+/cube_category   std_msgs/String 话题
+/gazebo_success  ROS 参数
+```
+
+UDP 桥默认关闭，避免与默认开启的 TCP 桥重复转发。启用 UDP 时建议显式关闭 TCP：
+
+```bash
+roslaunch car3 nav_pick_place_task.launch \
+  tcp_bridge:=false \
+  udp_bridge:=true \
+  udp_bind_host:=0.0.0.0 \
+  udp_bind_port:=9000 \
+  udp_remote_host:=192.168.10.246 \
+  udp_remote_port:=9000
+```
+
+每个 UDP 数据报包含一个 UTF-8 JSON 对象；同一数据报内也兼容多行 JSON。协议字段与 TCP 桥一致：
+
+```json
+{"type":"cube_category","topic":"/cube_category","value":"food"}
+{"type":"gazebo_success","param":"/gazebo_success","value":1}
+```
+
+收到 `cube_category` 后发布本机话题，收到 `gazebo_success` 后设置本机参数；本机话题消息和参数变化会发送到配置的远端地址。`/gazebo_success` 默认每 `0.2 s` 轮询且只在值变化时发送。UDP 无连接、无 ACK、无可靠重传；需要可靠交付时继续使用 TCP 桥或由外部协议实现确认与重发。
+
+---
+
+## 18. 抓取后运输起点的代价地图刷新
+
+一次 daily/C 区运行中抓取成功且保持 `GRASPING/cube_1`，但两个停车朝向都在运输起点失败。move_base 依次报告局部轨迹不可行、全局规划失败，以及当前位置存在潜在碰撞。该位置在静态地图中仍有约 `0.35 m` 净空，失败特征符合地面物块被抬走后，global/local obstacle layer 仍短暂保留原激光障碍点，使机器人被判定处于碰撞区。
+
+执行器现在在 `PREPARE_TRANSPORT` 中完成抬臂并确认附着，然后调用既有 `/move_base/clear_costmaps`，等待 global/local costmap 各发布至少一次新更新，再进入 `NAVIGATE_TO_PARKING`。该刷新只针对动态 obstacle layer；静态地图由 static layer 恢复，不修改地图、规划器或抓取后端。日志应出现：
+
+```text
+pick_place state: PREPARE_TRANSPORT
+costmaps refreshed after pickup: global_updates=... local_updates=...
+pick_place state: NAVIGATE_TO_PARKING
+```
+
+任务启动时原有的固定 `navigation_startup_delay: 10.0` 已移除。执行器进入 `WAIT_NAVIGATION_READY` 后立即检查 map、scan、map 到底盘 TF 和位姿稳定性；真实导航数据未就绪时仍会等待，避免用固定时间盲等，也不会在导航尚未可用时发送目标。
+
+---
+
+## 19. 抓取准备失败自动重试
+
+`PREPARE_GRASP` 中若 `/grasp_attach/ready` 或 `attach_offset` 未进入保守夹取框，执行器不再立即退出。因为此时夹爪尚未闭合且没有附着，状态机会进入 `RETRY_GRASP_ALIGN`，重新观察并再次执行精对位，默认最多重试 2 次。
+
+近距离相机仍丢帧时，执行器使用抓取后端在失败姿态下已经发布的实时 `attach_offset` 重建一次目标 map 坐标。该回退目标必须在上一次视觉目标 `0.12 m` 内，否则拒绝使用，避免误跟随其他物块。只有准备阶段错误会自动重试；夹爪已经闭合后的 attach 型号错误或运输中丢失仍按原有失败恢复处理。
+
+预期日志：
+
+```text
+grasp preparation failed: ... ready=False offset=(...)
+using grasp offset fallback for retry: ...
+pick_place state: RETRY_GRASP_ALIGN
+retrying grasp alignment 1/2
+```
+
+---
+
+## 20. 粗对位改为一次直达
+
+原粗对位每次最多移动 `0.15 m`，一次典型运行从 `0.435 m` 误差经过 `0.285/0.123/0.000 m`，产生三次 move_base 和多次重复观察。现在 `max_align_step` 调整为 `1.0 m`，正常情况下直接导航到第一次视觉估计的抓取前位姿，到达后只重新观察一次，再进入最后 `8 cm` 内的受限 `/cmd_vel` 精调。
+
+`max_align_iterations` 保留为 2：如果到达后的 fresh Pose 显示误差仍大于 `0.08 m`，允许一次额外 move_base 粗修正；如果相机丢帧，则沿用最后稳定目标并由既有 `PREPARE_GRASP` 自动重试保护兜底。ready、attach_offset、附着型号和运输检查均未放宽。

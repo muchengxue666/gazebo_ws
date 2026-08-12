@@ -7,11 +7,21 @@
   <arg name="tcp_bridge" default="true"/>
   <arg name="tcp_remote_host" default="192.168.10.246"/>
   <arg name="tcp_remote_port" default="9000"/>
+  <arg name="udp_bridge" default="false"/>
+  <arg name="udp_bind_host" default="0.0.0.0"/>
+  <arg name="udp_bind_port" default="9000"/>
+  <arg name="udp_remote_host" default="192.168.10.246"/>
+  <arg name="udp_remote_port" default="9000"/>
 
   <!-- Canonical validated navigation entry; do not replace with gazebo_nav.launch. -->
-  <!-- The immutable attach backend uses a strict '<' close check. A threshold
-       just above the valid 0.8 command makes r_joint=0.8 trigger grasp. -->
-  <param name="/grasp_attach/gripper_close_threshold" value="0.81"/>
+  <!-- The immutable attach backend uses a strict '<' close check. Contact
+       with a correctly aligned cube can stop the physical joint slightly
+       above the 0.8 controller target, so keep a small trigger margin. -->
+  <param name="/grasp_attach/gripper_close_threshold" value="0.86"/>
+  <!-- Arm motion can briefly push the measured finger joint above 0.89 even
+       while the 0.8 close target is held. The task never places the cube;
+       reserve release for the explicit 1.5 open command. -->
+  <param name="/grasp_attach/gripper_open_threshold" value="1.2"/>
 
   <include file="$(find gazebo_nav)/launch/static_nav_sim.launch">
     <arg name="gui" value="$(arg gui)"/>
@@ -45,6 +55,15 @@
         type="tcp_ros_bridge.py" output="screen">
     <param name="remote_host" value="$(arg tcp_remote_host)"/>
     <param name="remote_port" value="$(arg tcp_remote_port)"/>
+    <param name="category_topic" value="$(arg cube_category_topic)"/>
+  </node>
+
+  <node if="$(arg udp_bridge)" name="udp_ros_bridge" pkg="car3"
+        type="udp_ros_bridge.py" output="screen">
+    <param name="bind_host" value="$(arg udp_bind_host)"/>
+    <param name="bind_port" value="$(arg udp_bind_port)"/>
+    <param name="remote_host" value="$(arg udp_remote_host)"/>
+    <param name="remote_port" value="$(arg udp_remote_port)"/>
     <param name="category_topic" value="$(arg cube_category_topic)"/>
   </node>
 </launch>

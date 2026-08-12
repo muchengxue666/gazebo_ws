@@ -37,7 +37,9 @@ min_template_coverage: 0.008
 min_roi_coverage: 0.004
 min_category_margin: 0.45
 template_category_fraction: 0.55
-max_unknown_frames: 1
+# At 5 Hz, retain valid category/pose votes across about one second of
+# intermittent corner-view or post-motion dropouts.
+max_unknown_frames: 5
 stability_samples: 5
 required_votes: 3
 max_position_std: 0.025
