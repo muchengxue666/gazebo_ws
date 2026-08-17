@@ -67,6 +67,14 @@ attach_timeout: 5.0
 # safe to reacquire/re-align a bounded number of times instead of exiting.
 grasp_prepare_retries: 2
 grasp_retry_max_target_shift: 0.12
+# After any failed attempt that already located the target, keep the current
+# category and repeatedly search around the stopped failure pose. The node
+# does not return home or wait for another /cube_category command.
+failure_search_retry_delay: 1.0
+# Bounded offsets (metres, map frame) searched around the live failure pose.
+# The object coordinates remain entirely vision/TF-derived.
+failure_search_offsets: [[0.0, 0.0], [0.12, 0.0], [-0.12, 0.0],
+                         [0.0, 0.12], [0.0, -0.12]]
 nav_retries: 1
 # Normally navigate directly from the search pose to the estimated grasp pose.
 # Keep one additional coarse correction only when the fresh observation still
@@ -102,7 +110,9 @@ coarse_search_pose: {x: -1.40, y: -0.4311, yaw: 1.7201}
 area_search_waypoints:
   - {area: area_a, x: -1.35, y: -0.4311, yaw: 1.7201}
   - {area: area_b, x: -1.40, y: -0.40, yaw: 0.0}
-  - {area: area_c, x: -1.20, y: -0.53, yaw: -1.5708}
+  # C is closest to the arm camera; keep an extra standoff for near-spawned
+  # cubes while remaining inside the same random source-area view.
+  - {area: area_c, x: -1.40, y: -0.53, yaw: -1.5708}
 area_search_timeout: 6.0
 # Keep the vehicle parked and pan only arm_joint1 when a cube lies near a
 # camera-image corner. These offsets are relative to the area's center view.
@@ -110,6 +120,13 @@ area_search_pan_offsets: [0.45, -0.45]
 area_search_pan_timeout: 4.0
 # Let Gazebo camera queues drain after each arm pan before resetting votes.
 area_search_view_settle_time: 0.8
+# Only after center and pan views miss, back away from the area's center and
+# repeat the views once. This handles near-edge cubes without slowing normal
+# searches or hard-coding any random cube coordinate.
+area_search_standoff_distance: 0.18
+# Do not use an almost-limit arm_joint1 compensation for a large area yaw
+# change; first rotate the base with the arm raised.
+area_search_reorient_yaw_threshold: 2.50
 # Retry the complete stationary A/B/C search once before declaring failure.
 area_search_passes: 2
 # A target candidate must survive independent vote resets at the same pose.

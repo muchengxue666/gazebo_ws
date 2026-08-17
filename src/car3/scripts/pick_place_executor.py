@@ -67,6 +67,12 @@ class PickPlaceExecutor:
             rospy.get_param('~grasp_prepare_retries', 2))
         self.grasp_retry_max_target_shift = float(
             rospy.get_param('~grasp_retry_max_target_shift', 0.12))
+        self.failure_search_retry_delay = float(
+            rospy.get_param('~failure_search_retry_delay', 1.0))
+        self.failure_search_offsets = rospy.get_param(
+            '~failure_search_offsets', [[0.0, 0.0], [0.12, 0.0],
+                                        [-0.12, 0.0], [0.0, 0.12],
+                                        [0.0, -0.12]])
         self.joint_tolerance = float(
             rospy.get_param('~joint_tolerance', 0.03))
         self.goal_time_tolerance = float(
@@ -112,6 +118,10 @@ class PickPlaceExecutor:
             rospy.get_param('~area_search_pan_timeout', 4.0))
         self.area_search_view_settle_time = float(
             rospy.get_param('~area_search_view_settle_time', 0.8))
+        self.area_search_standoff_distance = float(
+            rospy.get_param('~area_search_standoff_distance', 0.18))
+        self.area_search_reorient_yaw_threshold = float(
+            rospy.get_param('~area_search_reorient_yaw_threshold', 2.50))
         self.area_search_passes = int(
             rospy.get_param('~area_search_passes', 2))
         self.search_target_confirmations = int(
@@ -206,6 +216,7 @@ class PickPlaceExecutor:
         self.grasp_tcp_in_base = None
         self.transport_tcp_in_base = None
         self.place_tcp_in_base = None
+        self.target_was_located = False
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(20.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
@@ -322,6 +333,16 @@ class PickPlaceExecutor:
                 or self.area_search_view_settle_time <= 0.0):
             raise rospy.ROSInitException(
                 'area_search_view_settle_time must be positive')
+        if (not math.isfinite(self.area_search_standoff_distance)
+                or self.area_search_standoff_distance <= 0.0
+                or self.area_search_standoff_distance > 0.30):
+            raise rospy.ROSInitException(
+                'area_search_standoff_distance must be in (0, 0.30]')
+        if (not math.isfinite(self.area_search_reorient_yaw_threshold)
+                or self.area_search_reorient_yaw_threshold <= 0.0
+                or self.area_search_reorient_yaw_threshold > math.pi):
+            raise rospy.ROSInitException(
+                'area_search_reorient_yaw_threshold must be in (0, pi]')
         if self.area_search_passes < 1:
             raise rospy.ROSInitException(
                 'area_search_passes must be at least one')
@@ -360,6 +381,20 @@ class PickPlaceExecutor:
                 or self.grasp_retry_max_target_shift <= 0.0):
             raise rospy.ROSInitException(
                 'grasp_retry_max_target_shift must be positive')
+        if (not math.isfinite(self.failure_search_retry_delay)
+                or self.failure_search_retry_delay <= 0.0):
+            raise rospy.ROSInitException(
+                'failure_search_retry_delay must be positive')
+        if (not isinstance(self.failure_search_offsets, list)
+                or not self.failure_search_offsets):
+            raise rospy.ROSInitException(
+                'failure_search_offsets must be a non-empty list')
+        for offset in self.failure_search_offsets:
+            if (not isinstance(offset, list) or len(offset) != 2
+                    or not all(math.isfinite(float(value)) for value in offset)
+                    or math.hypot(float(offset[0]), float(offset[1])) > 0.25):
+                raise rospy.ROSInitException(
+                    'failure_search_offsets must contain finite offsets <= 0.25 m')
         for name, value in (
                 ('search_direct_max_distance',
                  self.search_direct_max_distance),
@@ -543,13 +578,16 @@ class PickPlaceExecutor:
                 'failure recovery will not move arm while attachment remains: '
                 'state=%s model=%s', self.grasp_state, self.attached_model)
             self._stop_base()
-            return
+            return False
 
         try:
             self._move_arm('navigation')
         except (rospy.ROSException, RuntimeError) as exc:
             rospy.logwarn('failure recovery could not raise arm: %s', exc)
+            self._stop_base()
+            return False
         self._stop_base()
+        return True
 
     def _wait_for_action_server(self, client, label):
         # actionlib's timeout uses simulated ROS time. During Gazebo startup
@@ -1103,17 +1141,20 @@ class PickPlaceExecutor:
         rospy.logwarn('%s direct move timed out', label)
         return False
 
-    def _rotate_search_at_pose(self, waypoint):
+    def _rotate_search_at_pose(
+            self, waypoint, label='coarse search', navigate_to_pose=True):
         search_x = float(waypoint['x'])
         search_y = float(waypoint['y'])
         search_yaw = float(waypoint['yaw'])
-        label = 'coarse search'
-        started = time.monotonic()
-        if not self._navigate(search_x, search_y, search_yaw, label, retries=0):
-            self._log_timing('search.coarse.navigation', started, 'failed')
-            rospy.logwarn('%s navigation failed; trying fixed area searches', label)
-            return None
-        self._log_timing('search.coarse.navigation', started)
+        if navigate_to_pose:
+            started = time.monotonic()
+            if not self._navigate(
+                    search_x, search_y, search_yaw, label, retries=0):
+                self._log_timing('search.coarse.navigation', started, 'failed')
+                rospy.logwarn(
+                    '%s navigation failed; trying fixed area searches', label)
+                return None
+            self._log_timing('search.coarse.navigation', started)
         self._stop_base()
         started = time.monotonic()
         time.sleep(self.search_settle_time)
@@ -1205,7 +1246,43 @@ class PickPlaceExecutor:
         rospy.loginfo('%s completed without target; continuing search', label)
         return None
 
-    def _search_area_waypoint(self, waypoint, index):
+    def _search_near_failure(self, failure_pose):
+        """Search around the stopped failure pose without returning home."""
+        search_x, search_y, search_yaw = failure_pose
+        self._set_state('SEARCH_NEAR_FAILURE')
+        rospy.logwarn(
+            'retrying target %s around failure pose (%.3f, %.3f, %.3f)',
+            self.target_category, search_x, search_y, search_yaw)
+        for index, offset in enumerate(self.failure_search_offsets):
+            offset_x = float(offset[0])
+            offset_y = float(offset[1])
+            target_x = search_x + offset_x
+            target_y = search_y + offset_y
+            if not self._inside_map(target_x, target_y, margin=0.05):
+                rospy.logwarn(
+                    'failure-local offset %d leaves map; skipping', index)
+                continue
+            # The observe arm blocks the laser plane. Raise it before each
+            # short translation, then lower it only while stopped. Always
+            # calculate offsets from the original failure pose so repeated
+            # passes cannot drift across the map.
+            self._move_arm('navigation')
+            moved = self._direct_search_move(
+                target_x, target_y,
+                'failure-local move {}'.format(index))
+            if not moved:
+                continue
+            waypoint = {'x': target_x, 'y': target_y, 'yaw': search_yaw}
+            detection = self._rotate_search_at_pose(
+                waypoint, label='failure-local search {}'.format(index),
+                navigate_to_pose=False)
+            if detection is not None:
+                return detection
+        self._move_arm('navigation')
+        return None
+
+    def _search_area_waypoint(self, waypoint, index,
+                              _standoff_attempt=False):
         area = str(waypoint['area'])
         label = 'area search {} ({})'.format(index, area)
         target_x = float(waypoint['x'])
@@ -1237,19 +1314,45 @@ class PickPlaceExecutor:
         if move_mode == 'direct':
             _, _, actual_yaw = self._base_pose_map()
             nominal_joint1 = self._read_arm_pose('observe')[0][0]
-            yaw_delta = target_yaw - actual_yaw
-            candidates = [yaw_delta + 2.0 * math.pi * turns
-                          for turns in (-1, 0, 1)]
-            valid_offsets = [offset for offset in candidates
-                             if -3.14 <= nominal_joint1 + offset <= 3.14]
-            if not valid_offsets:
-                raise RuntimeError(
-                    '{} has no observe joint1 compensation within limits'.format(
-                        label))
-            joint1_offset = min(valid_offsets, key=abs)
-            rospy.loginfo(
-                '%s keeping base yaw; observe joint1 compensation=%.3f rad',
-                label, joint1_offset)
+            yaw_delta = self._wrap_angle(target_yaw - actual_yaw)
+            if abs(yaw_delta) > self.area_search_reorient_yaw_threshold:
+                # Large arm_joint1 compensation is especially fragile for
+                # area_c (it can approach the joint limit and hide a near
+                # cube). Reorient the base while the arm is safely raised;
+                # ordinary area transitions retain the faster direct mode.
+                rospy.loginfo(
+                    '%s yaw delta %.3f exceeds %.3f; reorienting base with '
+                    'move_base before observe', label, yaw_delta,
+                    self.area_search_reorient_yaw_threshold)
+                self._move_arm('navigation')
+                reoriented = self._navigate(
+                    target_x, target_y, target_yaw,
+                    label + ' yaw reorientation', retries=0)
+                if reoriented:
+                    move_mode = 'move_base'
+                    rospy.loginfo(
+                        '%s base reoriented; using nominal observe joint1',
+                        label)
+                else:
+                    rospy.logwarn(
+                        '%s base reorientation failed; retaining bounded '
+                        'joint1 compensation', label)
+            if move_mode == 'move_base':
+                joint1_offset = 0.0
+            else:
+                yaw_delta = self._wrap_angle(target_yaw - actual_yaw)
+                candidates = [yaw_delta + 2.0 * math.pi * turns
+                              for turns in (-1, 0, 1)]
+                valid_offsets = [offset for offset in candidates
+                                 if -3.14 <= nominal_joint1 + offset <= 3.14]
+                if not valid_offsets:
+                    raise RuntimeError(
+                        '{} has no observe joint1 compensation within limits'.format(
+                            label))
+                joint1_offset = min(valid_offsets, key=abs)
+                rospy.loginfo(
+                    '%s keeping base yaw; observe joint1 compensation=%.3f rad',
+                    label, joint1_offset)
         detection = None
         non_target_detection = None
         non_target_conflict = False
@@ -1342,6 +1445,47 @@ class PickPlaceExecutor:
             rospy.loginfo(
                 '%s completed without a cube after %d stationary views',
                 label, len(view_offsets))
+            # A cube at the near edge of a source area can be inside the
+            # camera near field or outside the arm-camera frustum from the
+            # nominal waypoint.  Keep the normal center/corner search fast;
+            # only after all stationary views fail, move a bounded distance
+            # away from the area's center and repeat the same views once.
+            if not _standoff_attempt:
+                bounds = self.search_areas.get(area, {})
+                try:
+                    area_center_x = 0.5 * (
+                        float(bounds['x_min']) + float(bounds['x_max']))
+                    area_center_y = 0.5 * (
+                        float(bounds['y_min']) + float(bounds['y_max']))
+                except (KeyError, TypeError, ValueError):
+                    area_center_x = target_x
+                    area_center_y = target_y
+                away_x = target_x - area_center_x
+                away_y = target_y - area_center_y
+                away_norm = math.hypot(away_x, away_y)
+                if away_norm < 1e-6:
+                    away_x = math.cos(target_yaw)
+                    away_y = math.sin(target_yaw)
+                    away_norm = 1.0
+                standoff_x = target_x + (
+                    self.area_search_standoff_distance * away_x / away_norm)
+                standoff_y = target_y + (
+                    self.area_search_standoff_distance * away_y / away_norm)
+                if self._inside_map(standoff_x, standoff_y, margin=0.05):
+                    rospy.logwarn(
+                        '%s missed from nominal view; retrying %.2f m '
+                        'farther from %s center at (%.3f, %.3f)',
+                        label, self.area_search_standoff_distance, area,
+                        standoff_x, standoff_y)
+                    self._move_arm('navigation')
+                    standoff_waypoint = dict(waypoint)
+                    standoff_waypoint['x'] = standoff_x
+                    standoff_waypoint['y'] = standoff_y
+                    standoff_pose = self._search_area_waypoint(
+                        standoff_waypoint, index,
+                        _standoff_attempt=True)
+                    if standoff_pose is not None:
+                        return standoff_pose
             self._move_arm('navigation')
             return None
 
@@ -1459,10 +1603,14 @@ class PickPlaceExecutor:
     def _wrap_angle(angle):
         return math.atan2(math.sin(angle), math.cos(angle))
 
-    def _align_to_grasp_with_fine_tolerance(self, first_pose):
+    def _align_to_grasp_with_fine_tolerance(
+            self, first_pose, require_source_area=True):
         self._set_state('ALIGN_TO_GRASP')
         target_pose = first_pose
-        self._classify_search_area(target_pose)
+        if require_source_area:
+            self._classify_search_area(target_pose)
+        else:
+            self.detected_area_pub.publish(String(data='failure_local'))
         first_target = self._point_in_frame(target_pose, 'map').point
         first_base_x, first_base_y, first_base_yaw = self._base_pose_map()
         first_bearing = math.atan2(
@@ -1531,8 +1679,9 @@ class PickPlaceExecutor:
                 target_pose = refreshed_pose
         raise RuntimeError('visual alignment did not converge')
 
-    def _align_to_grasp(self, first_pose):
-        self._align_to_grasp_with_fine_tolerance(first_pose)
+    def _align_to_grasp(self, first_pose, require_source_area=True):
+        self._align_to_grasp_with_fine_tolerance(
+            first_pose, require_source_area=require_source_area)
 
     def _prepare_stationary_grasp(self):
         self._set_state('PREPARE_GRASP')
@@ -1609,7 +1758,8 @@ class PickPlaceExecutor:
             return observed_pose
         return offset_pose
 
-    def _align_prepare_and_grasp(self, first_pose):
+    def _align_prepare_and_grasp(
+            self, first_pose, require_source_area=True):
         target_pose = first_pose
         for attempt in range(self.grasp_prepare_retries + 1):
             if attempt:
@@ -1617,7 +1767,8 @@ class PickPlaceExecutor:
                 rospy.logwarn(
                     'retrying grasp alignment %d/%d',
                     attempt, self.grasp_prepare_retries)
-            self._align_to_grasp(target_pose)
+            self._align_to_grasp(
+                target_pose, require_source_area=require_source_area)
             try:
                 self._prepare_stationary_grasp()
             except GraspPreparationError as exc:
@@ -1782,7 +1933,7 @@ class PickPlaceExecutor:
                 rospy.logwarn('parking alignment failed: %s', exc)
         raise RuntimeError('no parking approach goal was reachable')
 
-    def run(self):
+    def run(self, initial_detection=None, failure_local_detection=False):
         self._set_state('INIT_VALIDATE')
         if not self.arm_poses_verified:
             raise RuntimeError(
@@ -1812,12 +1963,19 @@ class PickPlaceExecutor:
         # a previous task may have left the arm in its place posture.
         self._move_arm('navigation')
         self._wait_for_navigation_ready()
-
         # Search first. Geometry measurement moves through grasp/place poses
         # and must not delay the initial navigation.
-        detection = self._search()
-        self._measure_arm_geometry()
-        self._align_prepare_and_grasp(detection)
+        detection = initial_detection
+        if detection is None:
+            detection = self._search()
+            failure_local_detection = False
+        self.target_was_located = True
+        if any(value is None for value in (
+                self.grasp_tcp_in_base, self.transport_tcp_in_base,
+                self.place_tcp_in_base)):
+            self._measure_arm_geometry()
+        self._align_prepare_and_grasp(
+            detection, require_source_area=not failure_local_detection)
         self._navigate_to_parking()
         self._set_state('SUCCESS')
         rospy.set_param('/gazebo_success', 1)
@@ -1827,22 +1985,72 @@ class PickPlaceExecutor:
 
 def main():
     rospy.init_node('pick_place_executor')
-    executor = None
     try:
         executor = PickPlaceExecutor()
-        executor.wait_for_target_category()
-        executor.run()
-    except (rospy.ROSException, rospy.ROSInitException, RuntimeError) as exc:
-        rospy.logerr('pick-park FAILED: %s', exc)
-        rospy.set_param('/gazebo_success', 0)
-        if executor is not None:
-            try:
-                executor._recover_after_failure()
-            except (rospy.ROSException, RuntimeError) as recovery_exc:
-                rospy.logerr('pick-place failure recovery failed: %s', recovery_exc)
-            executor._set_state('FAILED')
-            executor.result_pub.publish(String(data='FAILED:' + str(exc)))
+    except (rospy.ROSException, rospy.ROSInitException) as exc:
+        rospy.logfatal('pick-place executor initialization failed: %s', exc)
         raise SystemExit(1)
+
+    executor.wait_for_target_category()
+    retry_detection = None
+    retry_is_failure_local = False
+    while not rospy.is_shutdown():
+        try:
+            executor.run(
+                initial_detection=retry_detection,
+                failure_local_detection=retry_is_failure_local)
+            return
+        except (rospy.ROSException, RuntimeError) as exc:
+            rospy.logerr('pick-park attempt failed; keeping category %s: %s',
+                         executor.target_category, exc)
+            rospy.set_param('/gazebo_success', 0)
+            executor.result_pub.publish(String(data='RETRYING:' + str(exc)))
+            retry_detection = None
+            retry_is_failure_local = False
+            try:
+                failure_pose = executor._base_pose_map()
+            except RuntimeError as pose_exc:
+                failure_pose = None
+                rospy.logerr('could not record failure pose: %s', pose_exc)
+
+            # Once a target has been located, keep recovering and searching
+            # around the failure pose until that same category is seen again.
+            # Do not clear target_category or return to WAITING_FOR_CATEGORY.
+            while not rospy.is_shutdown() and retry_detection is None:
+                try:
+                    recovered = executor._recover_after_failure()
+                except (rospy.ROSException, RuntimeError) as recovery_exc:
+                    recovered = False
+                    rospy.logerr(
+                        'pick-place failure recovery failed: %s', recovery_exc)
+                if not recovered:
+                    time.sleep(executor.failure_search_retry_delay)
+                    continue
+                if not executor.target_was_located:
+                    # No target pose existed (for example, all source views
+                    # missed), so retry the normal A/B/C search.
+                    break
+                if failure_pose is None:
+                    try:
+                        failure_pose = executor._base_pose_map()
+                    except RuntimeError as pose_exc:
+                        rospy.logerr(
+                            'failure pose remains unavailable: %s', pose_exc)
+                        time.sleep(executor.failure_search_retry_delay)
+                        continue
+                try:
+                    retry_detection = executor._search_near_failure(
+                        failure_pose)
+                except (rospy.ROSException, RuntimeError) as search_exc:
+                    rospy.logerr(
+                        'failure-local target search failed: %s', search_exc)
+                if retry_detection is None:
+                    rospy.logwarn(
+                        'target %s not found around failure pose; retrying '
+                        'locally without waiting for another command',
+                        executor.target_category)
+                    time.sleep(executor.failure_search_retry_delay)
+            retry_is_failure_local = retry_detection is not None
 
 
 if __name__ == '__main__':
