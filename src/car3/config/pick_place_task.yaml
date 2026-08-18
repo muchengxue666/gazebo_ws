@@ -1,6 +1,6 @@
 output_frame: map
 camera_info_topic: /camera/rgb/camera_info
-processing_rate: 5.0
+processing_rate: 8.0
 min_depth: 0.03
 max_depth: 1.0
 # Bright connected-component cube detector. It accepts multi-face silhouettes
@@ -39,7 +39,7 @@ min_template_coverage: 0.008
 min_roi_coverage: 0.004
 min_category_margin: 0.45
 template_category_fraction: 0.55
-# At 5 Hz, retain valid category/pose votes across about one second of
+# At 8 Hz, retain valid category/pose votes across about 0.6 seconds of
 # intermittent corner-view or post-motion dropouts.
 max_unknown_frames: 5
 stability_samples: 5

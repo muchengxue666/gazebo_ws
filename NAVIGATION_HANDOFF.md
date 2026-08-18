@@ -1000,7 +1000,7 @@ retrying grasp alignment 1/2
 
 ## 21. 任务失败后保持类别并在失败点重搜
 
-局部 `RETRY_GRASP_ALIGN` 两次仍不能满足保守夹取框，或者闭爪、运输和停车阶段发生异常时，执行器不再返回起点、发布最终 `FAILED` 或清空 `target_category`。它保持 `/gazebo_success=0`，发布 `RETRYING:<原因>`，打开夹爪并将机械臂恢复到 navigation 姿态，然后进入 `SEARCH_NEAR_FAILURE`。
+局部 `RETRY_GRASP_ALIGN` 两次仍不能满足保守夹取框，或者闭爪、运输和停车阶段发生异常时，执行器不再返回起点或清空 `target_category`。它保持 `/gazebo_success=0`，发布 `RETRYING:<原因>`，打开夹爪并将机械臂恢复到 navigation 姿态，然后进入 `SEARCH_NEAR_FAILURE`。只有安全恢复动作本身连续三次失败时，才明确发布 `FAILED` 并停车退出，避免无限停留在 `RECOVER_FAILURE`。
 
 `SEARCH_NEAR_FAILURE` 记录停车后的实时 `map -> base_footprint` 位姿，依次检查该点及其前后左右 `0.12 m` 的有界位置；每个位置只在停车并放下 observe 相机后通过受限 `/cmd_vel` 旋转寻找当前目标类别。完整一轮没有识别到目标时，会围绕同一个已记录失败位置继续重试，不等待新的 `/cube_category`，因此不会逐轮漂离失败区域。局部重搜得到的物块允许位于原随机 A/B/C 区域之外，以覆盖运输途中掉落的情况；物块坐标始终来自实时视觉，不写死物块位置。
 
@@ -1019,3 +1019,256 @@ C 区固定观察点从 `(-1.20, -0.53)` 后移到 `(-1.40, -0.53)`，为随机�
 另外，固定区域若要求的 yaw 与当前底盘朝向相差超过 `2.50 rad`，会先抬臂
 用 `move_base` 原地调整底盘，再使用 nominal observe 姿态，避免用接近关节
 限位的 `arm_joint1` 补偿造成中心/近场物块被相机遮挡。
+
+---
+
+## 23. 2026-08-18 随机多轮验证与运输恢复加固
+
+### 23.1 本轮修复
+
+真实 C 区运行中，夹取已进入 `GRASPING/cube_2`，但 transport 抬臂开始时
+`r_joint` 仍有短暂运动，触发抓取后端的释放竞态。受约束未修改
+`grasp_attach.py`；执行器改为在确认附着并发送 hold 后，使用既有
+`settle_timeout/settle_samples/settle_position_delta` 等待 `r_joint` 稳定，再抬臂。
+后续成功轮次的 `grasp.hold` 均约为 `0.301-0.351 s`，运输期间未再脱落。
+
+另外两处恢复路径保持小范围修改：
+
+- 停车导航使用正式 `nav_retries`，不再强制 `retries=0`；
+- `SEARCH_NEAR_FAILURE` 的受限直接平移超时后，在机械臂已抬起的前提下用
+  `move_base` 重试同一局部点，避免持续卡在直接移动超时或旋转漂移边界。
+
+### 23.2 真实 Gazebo 结果
+
+每轮完整任务均先关闭并重新启动 Gazebo，使物块重新随机生成；物块 map
+目标仍来自视觉。以下成功轮次最后都满足 `ready=True`、`GRASPING`、
+`attached_model` 与类别匹配、车体完全进入对应车间、`/gazebo_success=1`：
+
+```text
+类别         随机区域/生成坐标          最终 map 位姿 (x, y, yaw)
+daily        B (-1.385,  0.052)          (0.992, -1.500,  0.004)
+food         B (-1.484,  0.130)          (0.995, -2.980,  0.005)
+electronics  B (-1.484,  0.013)          (2.540, -2.220,  0.004)
+food         A (-2.038, -0.483)          (0.989, -2.980, -0.006)
+electronics  C (-0.845, -0.392)          (2.549, -2.220,  0.005)
+food         C (-0.930, -0.534)          (0.995, -2.980, -0.004)
+```
+
+A 区 food 的视觉目标为 `(-1.987, -0.505)`。C 区 electronics 首次
+`PREPARE_GRASP` 被保守抓取框拒绝，offset 重对位后成功；视觉目标从
+`(-0.774, -0.372)` 修正到 `(-0.776, -0.415)`。靠 C 区相机侧边缘的
+food 生成于 `(-0.930, -0.534)`，由视觉估计为 `(-0.861, -0.543)` 并完成
+抓取和停车。这些生成坐标只来自仿真启动日志，用于记录随机覆盖，未写入代码。
+
+无效类别 `invalid` 的单独验证保持 `WAITING_FOR_CATEGORY`，且
+`/gazebo_success=0`。
+
+### 23.3 大 yaw 与 standoff 当前结论
+
+一次 electronics/C 随机运行已真实出现：
+
+```text
+yaw delta 3.017 exceeds 2.500; reorienting base with move_base
+base reoriented; using nominal observe joint1
+missed from nominal view; retrying 0.18 m farther ... (-1.580, -0.532)
+```
+
+大 yaw 重定向和 standoff 移动本身执行成功，但该次后退视角没有重新识别
+目标；目标由第二轮正常 C 区视角找到。另一次 C 区抓取运输保持附着，但停车
+两种朝向均失败，随后局部恢复卡在直接移动超时/`0.080 m` 旋转漂移边界；
+这两次失败分别促成 23.1 的 settle、停车重试和局部 move_base 回退。
+
+本次新增的 C 区及 C 边缘成功轮次都在粗旋转 `3.41 rad` 时提前找到目标，
+没有进入固定区域 standoff 分支。因此目前可以确认大 yaw/standoff 日志和动作
+已真实触发，也可以确认 C 区中心及边缘物块能完成任务，但仍不能宣称
+“后退 0.18 m 后重新识别并继续成功”已经闭环。后续随机轮次仍需专门捕获该
+组合条件，不应通过写死坐标或修改生成脚本制造样本。
+
+### 23.4 检查
+
+修改后已通过：
+
+```text
+python3 -m py_compile src/car3/scripts/pick_place_executor.py
+3 个视觉单元测试
+catkin_make --pkg car3 -j2
+git diff --check
+```
+
+## 24. 2026-08-18 第一版快速区域搜索复测
+
+第一版快速路径已保留为可配置实验项 `fast_area_search`。它从一次粗搜索位姿
+依次使用 A/B/C 的中心和两个 `arm_joint1` pan 视角；目标候选仍需回到该区域
+标准观察点独立复核，区域外视觉 Pose 会被拒绝，完整粗旋转和固定区域多轮搜索
+仍是兜底。快速探测阶段不会触发 standoff，避免候选失败后重复后退观察。
+
+重新启动仿真取得随机分布后，实测：
+
+```text
+electronics / B: 初次快速路径 fast_area.total=139.475 s；当时还会在快速阶段
+                 触发 standoff，随后已加 guard 避免重复，最终 SUCCESS
+electronics / C: fast_area.total=105.477 s，标准 C 视角复核成功，最终 SUCCESS
+electronics / A: 正式粗旋转优先，search.total=80.184 s，固定 A 视角成功，
+                  首次 PREPARE_GRASP 失败后重对位，GRASPING/cube_2 并 SUCCESS
+```
+
+B/C 快速路径明显慢于完整粗旋转，因此正式配置将 `fast_area_search` 设为
+`false`；代码和参数仍保留，后续只有在真实视场或硬件动作时间改变并重新测量
+后才可重新启用。B 区标准观察点同步后移到 `(-1.40, -0.58)`，该位置来自
+区域中心向外的既有 `0.18 m` standoff 规则，不包含任何随机物块坐标。
+
+## 25. 2026-08-18 RECOVER_FAILURE 有界恢复
+
+一次 food/A 运行已成功进入 `GRASPING/cube_0`，随后 transport 机械臂未能在
+既有容差内稳定。夹爪释放后，恢复阶段重复发送与 transport 相同的 navigation
+姿态，但每次都出现 `navigation arm pose did not settle`；原主循环没有失败上限，
+因此会永久重复 `RECOVER_FAILURE`。
+
+执行器现在保留原安全约束和恢复动作，但连续三次恢复失败后会：
+
+```text
+发布零速度
+状态设为 FAILED
+结果发布 FAILED:failure recovery did not complete after 3 attempts
+保持 /gazebo_success=0
+退出任务执行器
+```
+
+任何一次恢复成功都会清零失败计数，并继续当前类别的失败点局部重搜。机械臂
+settle 超时日志现在包含五个关节各自的 target、actual 和 error，便于定位实际
+未收敛关节；没有放宽关节容差、稳定样本或安全姿态。
+
+新增 `test_pick_place_recovery.py` 模拟恢复永久失败，确认只调用三次恢复并进入
+`FAILED`。随机 Gazebo 回归中 food 位于 A 区 `(-2.064, -0.504)`，任务正常完成
+`ready=True`、`GRASPING/cube_0`、transport、停车和 `SUCCESS`，正常路径未回归。
+
+## 26. 2026-08-18 粗旋转停车确认与视觉频率
+
+视觉处理频率从 `5 Hz` 提高到保守的 `8 Hz`；Gazebo RGB 和 depth 相机均为
+`20 Hz`，因此仍保留一半以上的计算余量。`stability_samples=5`、
+`required_votes=3`、SIFT 参数和旋转速度均未放宽。生产配置关闭调试图；RGB
+和 depth 调试图现在只有在开关启用且存在订阅者时才生成，避免无用的图像复制
+与序列化。
+
+粗旋转看到目标类别后不再直接返回运动中的视觉 Pose。执行器会立即发布零速度，
+等待底盘稳定，reset 视觉历史，并要求新的静止稳定 Pose；静止 Pose 与运动候选
+的 map 平面距离还必须不超过既有 `search_target_confirm_distance=0.05 m`。
+确认失败时更新视觉序列屏障，从当前底盘 yaw 继续完成剩余旋转，而不是接受旧帧
+或直接跳过 A/B/C 固定视角兜底。
+
+新增 `test_pick_place_search.py` 覆盖静止近邻 Pose 接受和偏移 Pose 拒绝。当前检查：
+
+```text
+python3 -m unittest ...: 6 tests, OK
+catkin_make --pkg car3 -j2: passed
+catkin_make run_tests_car3 -j2: 6 tests, 0 errors, 0 failures
+python3 -m py_compile: passed
+git diff --check: passed
+```
+
+新的随机 Gazebo 实例确认参数服务器使用
+`/cube_vision/processing_rate=8.0`、`publish_debug_image=False`。完成回归的随机
+分布为 electronics/C `(-0.845, -0.607)`、daily/A `(-1.976, -0.453)`、
+food/B `(-1.481, 0.124)`，发布任务为 `electronics`。粗搜索先确认 daily 和 food
+非目标，然后在旋转 `3.54 rad` 时发现 electronics，停车后的独立静止确认日志为：
+
+```text
+stopped target confirmed: category=electronics confidence=1.000 shift=0.018 m
+search.coarse.stationary_confirm: 1.703 s accepted=True
+search.coarse.rotation: 17.797 s
+search.total: 52.079 s source=coarse
+```
+
+静止视觉目标为 `(-0.816, -0.606)`，分类到 `area_c` 后完成对位。抓取准备得到
+`ready=True`，夹取后为 `GRASPING/cube_2`；运输和停车完成后状态为 `SUCCESS`。
+任务结束后独立读取确认 `/gazebo_success=1`、`ready=True`、
+`grasp_state=GRASPING`、`attached_model=cube_2`。本轮证明新增停车确认不会破坏
+C 区近场边缘目标的完整抓取运输流程；单轮结果仍不能替代 food/daily 以及 A/B
+区域的后续随机多轮覆盖。
+
+## 27. 2026-08-18 靠墙物块两段式抓取
+
+为避免机械臂从收拢姿态直接下降时向墙面扫动，抓取准备改为两段轨迹：先到
+`grasp_approach`，再下降到原 `grasp`。新 approach 的 TCP 约在最终抓取点后方
+`0.045 m`、上方 `0.11 m`；最终抓取位姿和视觉对位目标均未改变。激光平面高于
+物块，本改动不使用雷达寻找物块或估计物块位置。
+
+干净重启 Gazebo 后，daily/cube_1 随机生成在 C 区
+`(-0.799, -0.581)`，距该区域东侧边界约 `0.029 m`。生成坐标只用于记录随机
+覆盖，正式任务仍使用视觉 Pose。任务在固定 C 区视角确认目标，并真实触发：
+
+```text
+yaw delta 3.048 exceeds 2.500; reorienting base with move_base
+base reoriented; using nominal observe joint1
+timing grasp.prepare.approach_arm: 3.966 s
+timing grasp.prepare.descend_arm: 3.513 s
+ready=True offset=(0.0044, -0.0048, 0.0107)
+grasp_state=GRASPING attached_model=cube_1
+```
+
+随后车辆保持抓取完成 daily 停车，状态为 `SUCCESS`。独立读取确认
+`/gazebo_success=1`、`/grasp_attach/ready=True`、
+`/grasp_attach/state=GRASPING`、`/grasp_attach/attached_model=cube_1`。
+这一轮确认两段式下降可完成靠边 daily 的抓取与运输；仍需按既有要求继续用每轮
+重新随机启动的方式覆盖其他墙边朝向，不能用这一轮替代三类别多轮回归。
+
+新增单元测试确认 `_prepare_stationary_grasp()` 严格按
+`grasp_approach -> grasp` 执行。当前检查为 `catkin_make --pkg car3 -j2` 通过，
+`run_tests_car3` 共 7 个测试、0 错误、0 失败，`git diff --check` 通过。
+
+## 28. 2026-08-18 近距离 A/B/C 顺序区域搜索
+
+粗旋转漏检后的第一轮区域搜索现在严格先完成 `area_a -> area_b -> area_c`，
+每个区域使用中心、`+0.45 rad`、`-0.45 rad` 三个机械臂视角。第一轮不再在 A
+漏检后立即执行 A 的 standoff；只有完整 A/B/C 均漏检，第二轮才允许原有
+`0.18 m` 后退兜底。目标一经确认仍立即结束搜索。
+
+三个固定观察点改为位于各自区域中心外侧约 `0.45 m`：
+
+```text
+area_a: (-1.560, -0.445)，从东侧观察
+area_b: (-1.395, -0.370)，从南侧观察
+area_c: (-1.310, -0.525)，从西侧观察
+```
+
+区域观察不再复用粗搜索的伸展 `observe` 姿态。新增 `area_observe` 将相机收回并
+抬高，理论地面视线中心约在底盘前方 `0.37 m`；随后使用 `arm_joint1` 左右 pan
+覆盖区域横向边缘。粗旋转仍使用原 `observe`，抓取和运输姿态未改变。
+
+真实 Gazebo 确定性分支验证仅将该测试进程的粗旋转角临时设为 `0.01 rad`，
+正式 YAML 已恢复 `6.283185`。本轮随机分布为 food/A
+`(-2.029, -0.601)`、daily/B `(-1.423, 0.027)`、electronics/C
+`(-0.943, -0.453)`；发布 `electronics` 后：
+
+```text
+coarse search missed; visiting area_a -> area_b -> area_c ...
+A 中心和 +0.45 视角确认 food 非目标
+B 中心和 -0.45 视角确认 daily 非目标
+C 中心视角分类冲突后，+0.45 视角以 3/3 确认 electronics
+search.total: source=area_c pass=1
+```
+
+三个近距离 waypoint 均由直接移动安全到达，第一轮没有 standoff 插入 A/B/C
+顺序。随后任务完成 `ready=True`、`GRASPING/cube_2`、停车 `SUCCESS`；独立
+读取确认 `/gazebo_success=1`、`attached_model=cube_2`。随机生成坐标只用于
+记录覆盖，物块定位仍来自视觉。
+
+## 29. 2026-08-18 搜索视野停车确认
+
+为减少运动中视觉误分类造成的无效搜索，粗旋转期间一旦出现任何已定位物块，
+执行器都会立即停车并执行独立静止确认。确认失败时清除本轮视觉屏障后从当前
+yaw 继续搜索；确认是非目标时抬臂退出粗旋转，转入固定的 `area_a -> area_b ->
+area_c` 顺序，不再继续旋转整圈。
+
+粗观察姿态已经得到有效物块位姿时，也先执行同样的静止确认，不会因为它是非
+目标而直接进入旋转。
+
+固定区域中心视角确认到非目标后默认立即结束该区域并进入下一区域；只有没有
+稳定物块确认时，才继续该区域的左右机械臂 pan 视角和第二轮 standoff 兜底。
+固定区域的观察 yaw 由 waypoint 指向对应区域边界中心自动计算，YAML 中的 yaw
+仅作为缺少区域边界时的后备值；短距离 A/B/C 转移保持当前底盘 yaw，优先用
+`arm_joint1` 补偿，只有机械臂没有合法补偿时才允许 yaw 重定向。观察姿态按
+`observe` 远距离中心视角、`area_observe` 近距离中心及左右 pan 视角分阶段执行。
+新增单元测试覆盖粗旋转发现非目标后停车确认并退出粗搜索。该行为已通过
+`catkin_make --pkg car3 -j2`、7 个 Python 搜索/恢复测试和 `git diff --check`；
+需要在干净随机 Gazebo 重启中继续覆盖三种类别和三个区域。

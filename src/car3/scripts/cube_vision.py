@@ -159,6 +159,9 @@ class CubeVision:
         return depth.astype(np.float32)
 
     def _publish_depth_debug(self, depth, header):
+        if (not self.publish_debug_image
+                or self.depth_debug_pub.get_num_connections() == 0):
+            return
         finite = np.isfinite(depth)
         valid = finite & (depth > 0.02) & (depth < self.depth_debug_max)
         debug = np.zeros(depth.shape, dtype=np.uint8)
@@ -220,7 +223,10 @@ class CubeVision:
             return
         self.camera_model.fromCameraInfo(camera_info_msg)
         candidates = self._find_candidates(rgb, depth)
-        debug = rgb.copy()
+        debug = (rgb.copy()
+                 if (self.publish_debug_image
+                     and self.debug_pub.get_num_connections() > 0)
+                 else None)
 
         if not candidates:
             self._diagnose(now, 'no cube candidate')
@@ -231,7 +237,8 @@ class CubeVision:
 
         best = candidates[0]
         valid_match = best['valid_match']
-        self._draw_candidate(debug, best, valid_match)
+        if debug is not None:
+            self._draw_candidate(debug, best, valid_match)
         if not valid_match:
             self._record_unknown_frame()
             self._publish_unknown(0.0)
@@ -467,7 +474,7 @@ class CubeVision:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
     def _publish_debug(self, image, source_msg):
-        if not self.publish_debug_image:
+        if image is None:
             return
         try:
             msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')

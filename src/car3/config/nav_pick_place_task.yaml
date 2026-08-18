@@ -38,6 +38,17 @@ arm_poses:
   observe:
     positions: [1.570006, 0.765642, 0.815474, 0.941225, 0.000000]
     duration: 3.0
+  # Retract and raise the camera for the closer fixed-area waypoints. The
+  # camera looks down near 0.37 m in front of the base, then arm_joint1 pans
+  # cover the left and right edges of each source region.
+  area_observe:
+    positions: [1.570006, 0.100000, 1.250000, 1.400000, 0.000000]
+    duration: 3.0
+  # Keep the TCP behind and about 11 cm above the final grasp point before
+  # descending. This avoids sweeping the arm through a nearby wall.
+  grasp_approach:
+    positions: [0.000000, 1.570820, -0.910000, 2.580000, 0.000000]
+    duration: 3.0
   grasp:
     positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.000000]
     duration: 3.0
@@ -105,30 +116,44 @@ vision_reset_service: /cube_vision/reset
 search_area_match_margin: 0.10
 # First try one broad rotating search from the verified camera pose.
 coarse_search_pose: {x: -1.40, y: -0.4311, yaw: 1.7201}
-# If the broad search misses, observe each source area from one fixed pose.
-# The base remains stationary at these three viewpoints.
+# If the broad search misses, visit A, B, and C in order before any standoff
+# retry. At each base waypoint the arm scans center, left, and right views.
 area_search_waypoints:
-  - {area: area_a, x: -1.35, y: -0.4311, yaw: 1.7201}
-  - {area: area_b, x: -1.40, y: -0.40, yaw: 0.0}
-  # C is closest to the arm camera; keep an extra standoff for near-spawned
-  # cubes while remaining inside the same random source-area view.
-  - {area: area_c, x: -1.40, y: -0.53, yaw: -1.5708}
+  # Each waypoint is about 0.45 m outside its configured region center.
+  - {area: area_a, x: -1.56, y: -0.445, yaw: 3.1415927}
+  - {area: area_b, x: -1.395, y: -0.37, yaw: 1.5707963}
+  - {area: area_c, x: -1.31, y: -0.525, yaw: 0.0}
 area_search_timeout: 6.0
-# Keep the vehicle parked and pan only arm_joint1 when a cube lies near a
-# camera-image corner. These offsets are relative to the area's center view.
+# Face each known source area with the vehicle first; arm_joint1 then handles
+# only the small center/edge camera views around that area.
 area_search_pan_offsets: [0.45, -0.45]
 area_search_pan_timeout: 4.0
+# Fixed areas use the verified far observation first. If that view misses,
+# retract the camera into the near observation pose and scan both edges with
+# arm_joint1; the base remains parked at the known area waypoint.
+area_search_view_stages:
+  - {pose: observe, pan_offsets: []}
+  - {pose: area_observe, pan_offsets: [0.45, -0.45]}
 # Let Gazebo camera queues drain after each arm pan before resetting votes.
 area_search_view_settle_time: 0.8
 # Only after center and pan views miss, back away from the area's center and
 # repeat the views once. This handles near-edge cubes without slowing normal
 # searches or hard-coding any random cube coordinate.
 area_search_standoff_distance: 0.18
-# Do not use an almost-limit arm_joint1 compensation for a large area yaw
-# change; first rotate the base with the arm raised.
+# The normal direct transition already closes position and yaw together. The
+# fallback threshold remains for a move_base transition or a fast-path view.
 area_search_reorient_yaw_threshold: 2.50
-# Retry the complete stationary A/B/C search once before declaring failure.
+# Pass 1 is the direct nominal A/B/C sweep. Pass 2 repeats the sweep with the
+# existing per-area 0.18 m standoff fallback enabled.
 area_search_passes: 2
+# Optional experiment: scan the three regions from the coarse search pose
+# before the normal search. Random B/C trials were slower than the complete
+# base rotation, so the production path keeps rotation first.
+fast_area_search: false
+# spawn_cubes places exactly one cube in each source region. Once a center view
+# independently confirms a non-target, no pan view can contain the requested
+# category, so the fast path may continue directly to the next region.
+fast_area_stop_on_non_target: true
 # A target candidate must survive independent vote resets at the same pose.
 search_target_confirmations: 2
 search_target_confirm_timeout: 4.0
@@ -141,6 +166,15 @@ search_rotation_angle: 6.283185
 search_rotation_timeout: 40.0
 search_rotation_rate: 20.0
 search_rotation_max_drift: 0.08
+# If rotation sees a cube near an image edge, use its visual map pose and the
+# live camera TF to rotate in place until it is near image center.
+coarse_center_enabled: true
+coarse_center_camera_frame: camera_depth_optical_frame
+coarse_center_tolerance: 0.08
+coarse_center_max_angle: 0.65
+coarse_center_timeout: 2.5
+coarse_center_gain: 1.5
+coarse_center_max_speed: 0.30
 # Once coarse navigation reaches the obstacle-free search zone, use bounded
 # map-TF feedback instead of invoking move_base for these short transitions.
 search_direct_max_distance: 0.30

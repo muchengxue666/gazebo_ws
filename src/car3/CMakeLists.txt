@@ -31,4 +31,6 @@ endforeach(dir)
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_cube_vision_offline.py)
+  catkin_add_nosetests(test/test_pick_place_recovery.py)
+  catkin_add_nosetests(test/test_pick_place_search.py)
 endif()

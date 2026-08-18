@@ -34,6 +34,7 @@ JOINT_NAMES = [
     'arm_joint1', 'arm_joint2', 'arm_joint3', 'arm_joint4', 'arm_joint5'
 ]
 TARGET_CATEGORIES = ('food', 'daily', 'electronics')
+MAX_FAILURE_RECOVERY_ATTEMPTS = 3
 
 
 class GraspPreparationError(RuntimeError):
@@ -114,6 +115,13 @@ class PickPlaceExecutor:
         self.area_search_pan_offsets = [
             float(value) for value in rospy.get_param(
                 '~area_search_pan_offsets', [0.25, -0.25])]
+        default_view_stages = [
+            {'pose': 'observe', 'pan_offsets': []},
+            {'pose': 'area_observe',
+             'pan_offsets': list(self.area_search_pan_offsets)},
+        ]
+        self.area_search_view_stages = rospy.get_param(
+            '~area_search_view_stages', default_view_stages)
         self.area_search_pan_timeout = float(
             rospy.get_param('~area_search_pan_timeout', 4.0))
         self.area_search_view_settle_time = float(
@@ -124,6 +132,10 @@ class PickPlaceExecutor:
             rospy.get_param('~area_search_reorient_yaw_threshold', 2.50))
         self.area_search_passes = int(
             rospy.get_param('~area_search_passes', 2))
+        self.fast_area_search = bool(
+            rospy.get_param('~fast_area_search', False))
+        self.fast_area_stop_on_non_target = bool(
+            rospy.get_param('~fast_area_stop_on_non_target', True))
         self.search_target_confirmations = int(
             rospy.get_param('~search_target_confirmations', 2))
         self.search_target_confirm_timeout = float(
@@ -155,6 +167,20 @@ class PickPlaceExecutor:
             rospy.get_param('~search_rotation_max_drift', 0.08))
         self.search_settle_time = float(
             rospy.get_param('~search_settle_time', 0.5))
+        self.coarse_center_camera_frame = rospy.get_param(
+            '~coarse_center_camera_frame', 'camera_depth_optical_frame')
+        self.coarse_center_enabled = bool(
+            rospy.get_param('~coarse_center_enabled', True))
+        self.coarse_center_tolerance = float(
+            rospy.get_param('~coarse_center_tolerance', 0.08))
+        self.coarse_center_max_angle = float(
+            rospy.get_param('~coarse_center_max_angle', 0.65))
+        self.coarse_center_timeout = float(
+            rospy.get_param('~coarse_center_timeout', 2.5))
+        self.coarse_center_gain = float(
+            rospy.get_param('~coarse_center_gain', 1.5))
+        self.coarse_center_max_speed = float(
+            rospy.get_param('~coarse_center_max_speed', 0.30))
         self.search_direct_max_distance = float(
             rospy.get_param('~search_direct_max_distance', 0.30))
         self.search_direct_timeout = float(
@@ -333,6 +359,25 @@ class PickPlaceExecutor:
                 or self.area_search_view_settle_time <= 0.0):
             raise rospy.ROSInitException(
                 'area_search_view_settle_time must be positive')
+        if (not isinstance(self.area_search_view_stages, list)
+                or not self.area_search_view_stages):
+            raise rospy.ROSInitException(
+                'area_search_view_stages must be a non-empty list')
+        for index, stage in enumerate(self.area_search_view_stages):
+            if not isinstance(stage, dict) or 'pose' not in stage:
+                raise rospy.ROSInitException(
+                    'area_search_view_stages[{}] is incomplete'.format(index))
+            pose_name = str(stage['pose'])
+            if pose_name not in self.arm_poses:
+                raise rospy.ROSInitException(
+                    'area_search_view_stages[{}] references missing pose {}'.format(
+                        index, pose_name))
+            offsets = stage.get('pan_offsets', [])
+            if (not isinstance(offsets, list)
+                    or not all(math.isfinite(float(value)) for value in offsets)):
+                raise rospy.ROSInitException(
+                    'area_search_view_stages[{}] pan_offsets are invalid'.format(
+                        index))
         if (not math.isfinite(self.area_search_standoff_distance)
                 or self.area_search_standoff_distance <= 0.0
                 or self.area_search_standoff_distance > 0.30):
@@ -349,6 +394,17 @@ class PickPlaceExecutor:
         if self.search_target_confirmations < 1:
             raise rospy.ROSInitException(
                 'search_target_confirmations must be at least one')
+        for name, value in (
+                ('coarse_center_tolerance', self.coarse_center_tolerance),
+                ('coarse_center_max_angle', self.coarse_center_max_angle),
+                ('coarse_center_timeout', self.coarse_center_timeout),
+                ('coarse_center_gain', self.coarse_center_gain),
+                ('coarse_center_max_speed', self.coarse_center_max_speed)):
+            if not math.isfinite(value) or value <= 0.0:
+                raise rospy.ROSInitException(name + ' must be positive')
+        if self.coarse_center_max_angle > math.pi:
+            raise rospy.ROSInitException(
+                'coarse_center_max_angle must not exceed pi')
         for name, value in (
                 ('search_target_confirm_timeout',
                  self.search_target_confirm_timeout),
@@ -418,7 +474,12 @@ class PickPlaceExecutor:
                 ('fine_align_yaw_tolerance', self.fine_align_yaw_tolerance)):
             if not math.isfinite(value) or value <= 0.0:
                 raise rospy.ROSInitException(name + ' must be positive')
-        for name in ('navigation', 'observe', 'grasp', 'transport', 'place'):
+        required_arm_poses = [
+            'navigation', 'observe', 'area_observe', 'grasp_approach',
+            'grasp', 'transport', 'place']
+        required_arm_poses.extend(
+            str(stage['pose']) for stage in self.area_search_view_stages)
+        for name in dict.fromkeys(required_arm_poses):
             self._read_arm_pose(name)
         for name, value in (
                 ('gripper_open', self.gripper_open),
@@ -758,7 +819,18 @@ class PickPlaceExecutor:
                 settled = 0
             previous = current
             rospy.sleep(0.05)
-        raise RuntimeError(name + ' arm pose did not settle')
+        current = [self.joint_values.get(joint) for joint in JOINT_NAMES]
+        diagnostics = []
+        for joint, target, actual in zip(JOINT_NAMES, positions, current):
+            if actual is None:
+                diagnostics.append('{}=unavailable'.format(joint))
+            else:
+                diagnostics.append(
+                    '{} target={:.3f} actual={:.3f} error={:.3f}'.format(
+                        joint, target, actual, actual - target))
+        raise RuntimeError(
+            '{} arm pose did not settle: {}'.format(
+                name, ', '.join(diagnostics)))
 
     def _command_gripper(self, target, label, attachment_satisfies=False):
         self.gripper_pub.publish(Float64(data=target))
@@ -822,7 +894,7 @@ class PickPlaceExecutor:
             return detection[1]
         return None
 
-    def _classify_search_area(self, pose):
+    def _search_area_name(self, pose):
         point = self._point_in_frame(pose, 'map').point
         matches = []
         margin = float(rospy.get_param('~search_area_match_margin', 0.03))
@@ -831,11 +903,60 @@ class PickPlaceExecutor:
                 if (float(bounds['x_min']) - margin <= point.x <= float(bounds['x_max']) + margin
                         and float(bounds['y_min']) - margin <= point.y <= float(bounds['y_max']) + margin):
                     matches.append(name)
-        if len(matches) != 1:
+        return matches[0] if len(matches) == 1 else None
+
+    def _area_observation_yaw(self, area, waypoint):
+        """Face the configured source-area center from a search waypoint."""
+        configured_yaw = float(waypoint['yaw'])
+        bounds = self.search_areas.get(area, {})
+        try:
+            center_x = 0.5 * (
+                float(bounds['x_min']) + float(bounds['x_max']))
+            center_y = 0.5 * (
+                float(bounds['y_min']) + float(bounds['y_max']))
+        except (KeyError, TypeError, ValueError):
+            rospy.logwarn(
+                'area %s has no complete bounds; using configured yaw %.3f',
+                area, configured_yaw)
+            return configured_yaw
+
+        dx = center_x - float(waypoint['x'])
+        dy = center_y - float(waypoint['y'])
+        if math.hypot(dx, dy) < 1e-6:
+            rospy.logwarn(
+                'area %s waypoint is at its center; using configured yaw %.3f',
+                area, configured_yaw)
+            return configured_yaw
+        yaw = math.atan2(dy, dx)
+        yaw_delta = self._wrap_angle(yaw - configured_yaw)
+        if abs(yaw_delta) > 0.15:
+            rospy.loginfo(
+                'area %s observation yaw derived from waypoint to area center: '
+                'configured=%.3f derived=%.3f delta=%.3f',
+                area, configured_yaw, yaw, yaw_delta)
+        return yaw
+
+    def _area_view_joint1_offset(
+            self, nominal_joint1, target_yaw, actual_yaw):
+        """Return the offset that makes the camera face the area in map yaw."""
+        desired_joint1 = self._wrap_angle(target_yaw - actual_yaw)
+        candidates = [desired_joint1 + 2.0 * math.pi * turns
+                      for turns in (-1, 0, 1)]
+        valid_targets = [value for value in candidates
+                         if -3.14 <= value <= 3.14]
+        if not valid_targets:
+            return None
+        target_joint1 = min(
+            valid_targets, key=lambda value: abs(value - nominal_joint1))
+        return target_joint1 - nominal_joint1
+
+    def _classify_search_area(self, pose):
+        point = self._point_in_frame(pose, 'map').point
+        area = self._search_area_name(pose)
+        if area is None:
             raise RuntimeError(
                 'vision target is not uniquely inside a search area: map=(%.3f, %.3f)' %
                 (point.x, point.y))
-        area = matches[0]
         self.detected_area_pub.publish(String(data=area))
         rospy.loginfo('vision target area=%s map=(%.3f, %.3f)', area, point.x, point.y)
         return area
@@ -871,6 +992,125 @@ class PickPlaceExecutor:
         except rospy.ServiceException as exc:
             rospy.logwarn('vision reset failed: %s', exc)
         return self._fresh_target_pose(barrier)
+
+    def _center_coarse_view(self, candidate_pose, label):
+        """Rotate only enough to bring a rotating-search candidate to center."""
+        if not getattr(self, 'coarse_center_enabled', True):
+            return False
+        camera_frame = getattr(
+            self, 'coarse_center_camera_frame', 'camera_depth_optical_frame')
+        try:
+            camera_point = self._point_in_current_frame(
+                candidate_pose, camera_frame).point
+            # Gazebo's depth sensor is pi-rolled relative to the URDF optical
+            # frame (the same conversion used by cube_vision), so its viewing
+            # direction is -Z in camera_depth_optical_frame.
+            initial_angle = math.atan2(
+                float(camera_point.x), -float(camera_point.z))
+        except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+            rospy.logwarn(
+                'coarse centering skipped at %s; camera TF unavailable: %s',
+                label, exc)
+            return False
+
+        if not math.isfinite(initial_angle) or float(camera_point.z) >= 0.0:
+            rospy.logwarn(
+                'coarse centering skipped at %s; candidate is behind camera',
+                label)
+            return False
+        if abs(initial_angle) <= self.coarse_center_tolerance:
+            rospy.loginfo(
+                'coarse target already centered at %s: horizontal_error=%.3f',
+                label, initial_angle)
+            return True
+        if abs(initial_angle) > self.coarse_center_max_angle:
+            rospy.logwarn(
+                'coarse centering skipped at %s; horizontal_error=%.3f exceeds '
+                'limit %.3f', label, initial_angle,
+                self.coarse_center_max_angle)
+            return False
+
+        rospy.loginfo(
+            'coarse target seen near image edge at %s; centering view '
+            'horizontal_error=%.3f', label, initial_angle)
+        self._set_state('CENTER_COARSE_VIEW')
+        deadline = time.monotonic() + self.coarse_center_timeout
+        period = 1.0 / max(10.0, float(self.search_rotation_rate))
+        command = Twist()
+        try:
+            while not rospy.is_shutdown() and time.monotonic() < deadline:
+                try:
+                    camera_point = self._point_in_current_frame(
+                        candidate_pose, camera_frame).point
+                    angle = math.atan2(
+                        float(camera_point.x), -float(camera_point.z))
+                except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+                    rospy.logwarn(
+                        'coarse centering lost camera TF at %s: %s', label, exc)
+                    return False
+                if float(camera_point.z) >= 0.0:
+                    return False
+                if abs(angle) <= self.coarse_center_tolerance:
+                    rospy.loginfo(
+                        'coarse view centered at %s: horizontal_error=%.3f',
+                        label, angle)
+                    return True
+                command.linear.x = 0.0
+                command.linear.y = 0.0
+                command.angular.z = self._clamp(
+                    self.coarse_center_gain * angle,
+                    self.coarse_center_max_speed)
+                self.cmd_vel_pub.publish(command)
+                time.sleep(period)
+        finally:
+            self._stop_base()
+        rospy.logwarn('coarse centering timed out at %s', label)
+        return False
+
+    def _confirm_stopped_search_target(self, candidate_pose, label):
+        """Accept a rotating-search target only from fresh stationary frames."""
+        self._stop_base()
+        centered = self._center_coarse_view(candidate_pose, label)
+        if not centered:
+            rospy.loginfo(
+                'coarse centering skipped/failed at %s; keeping stationary '
+                'confirmation fallback', label)
+        self._set_state('CONFIRM_CUBE')
+        time.sleep(self.search_settle_time)
+        barrier_seq = self.vision_pose_seq
+        try:
+            self.vision_reset()
+        except rospy.ServiceException as exc:
+            rospy.logwarn(
+                'vision reset failed during stopped confirmation at %s: %s',
+                label, exc)
+        fresh_pose = self._fresh_target_pose(
+            barrier_seq, timeout=self.search_target_confirm_timeout)
+        if fresh_pose is None:
+            rospy.logwarn(
+                'stopped confirmation produced no fresh target pose at %s',
+                label)
+            return None
+
+        candidate_point = self._point_in_frame(candidate_pose, 'map').point
+        fresh_point = self._point_in_frame(fresh_pose, 'map').point
+        shift = math.hypot(
+            fresh_point.x - candidate_point.x,
+            fresh_point.y - candidate_point.y)
+        if shift > self.search_target_confirm_distance:
+            rospy.logwarn(
+                'stopped confirmation rejected shifted target at %s: %.3f m '
+                '> %.3f m', label, shift,
+                self.search_target_confirm_distance)
+            return None
+
+        self.detected_category_pub.publish(
+            String(data=self.target_category))
+        rospy.loginfo(
+            'stopped target confirmed: category=%s confidence=%.3f '
+            'shift=%.3f m at %s', self.target_category,
+            self.vision_pose_confidence, shift, label)
+        return fresh_pose
 
     def _is_seen_non_target(self, category, pose):
         point = self._point_in_frame(pose, 'map').point
@@ -937,7 +1177,17 @@ class PickPlaceExecutor:
             time.sleep(0.05)
         return None
 
-    def _confirm_search_target(self, initial_detection, label):
+    def _confirm_search_target(self, initial_detection, label,
+                               expected_area=None, center_view=False):
+        # A rotating view can leave the candidate at the image edge. Stop
+        # before any confirmation reset so all subsequent frames are static.
+        self._stop_base()
+        if center_view:
+            centered = self._center_coarse_view(initial_detection[1], label)
+            if not centered:
+                rospy.loginfo(
+                    'coarse centering skipped/failed at %s; keeping stationary '
+                    'confirmation fallback', label)
         detections = [initial_detection]
         initial_point = self._point_in_frame(initial_detection[1], 'map').point
         for confirmation in range(self.search_target_confirmations):
@@ -957,6 +1207,13 @@ class PickPlaceExecutor:
                     '%s target confirmation %d/%d produced no stable pose',
                     label, confirmation + 1,
                     self.search_target_confirmations)
+                continue
+            if (expected_area is not None
+                    and self._search_area_name(detection[1]) != expected_area):
+                rospy.logwarn(
+                    '%s target confirmation %d/%d produced a pose outside '
+                    'expected %s area', label, confirmation + 1,
+                    self.search_target_confirmations, expected_area)
                 continue
             point = self._point_in_frame(detection[1], 'map').point
             distance = math.hypot(
@@ -1011,6 +1268,22 @@ class PickPlaceExecutor:
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException) as exc:
             raise RuntimeError('vision pose TF unavailable: {}'.format(exc))
+
+    def _point_in_current_frame(self, pose, target_frame):
+        """Transform a stationary map pose with the latest live robot TF."""
+        point = PointStamped()
+        point.header.frame_id = pose.header.frame_id
+        point.header.stamp = rospy.Time(0)
+        point.point = pose.pose.position
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame, point.header.frame_id, rospy.Time(0),
+                rospy.Duration(0.5))
+            return tf2_geometry_msgs.do_transform_point(point, transform)
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as exc:
+            raise RuntimeError(
+                'live vision pose TF unavailable: {}'.format(exc))
 
     def _base_pose_map(self):
         try:
@@ -1091,8 +1364,10 @@ class PickPlaceExecutor:
         rospy.logwarn('%s navigation failed', label)
         return False
 
-    def _direct_search_move(self, x, y, label):
-        base_x, base_y, hold_yaw = self._base_pose_map()
+    def _direct_search_move(self, x, y, label, hold_yaw=None):
+        base_x, base_y, current_yaw = self._base_pose_map()
+        if hold_yaw is None:
+            hold_yaw = current_yaw
         distance = math.hypot(x - base_x, y - base_y)
         if distance > self.search_direct_max_distance:
             rospy.loginfo(
@@ -1163,16 +1438,36 @@ class PickPlaceExecutor:
         self._move_arm('observe')
         self._log_timing('search.coarse.observe_arm', started)
         since_received = self.vision_pose_received
-        pose = self._current_detection(since_received)
-        if pose is not None:
-            self._stop_base()
+        initial_detection = self._current_known_detection(since_received)
+        if initial_detection is not None:
+            category, pose = initial_detection
             started = time.monotonic()
-            fresh_pose = self._reset_vision_and_observe()
-            self._log_timing('search.coarse.stationary_confirm', started)
-            if fresh_pose is not None:
-                return fresh_pose
-            rospy.logwarn('fresh stationary target pose unavailable at %s', label)
-            return pose
+            if category == self.target_category:
+                fresh_pose = self._confirm_stopped_search_target(pose, label)
+                confirmed = fresh_pose is not None
+                confirmed_detection = (
+                    (category, fresh_pose) if confirmed else None)
+            else:
+                confirmed, confirmed_detection = self._confirm_search_target(
+                    initial_detection, label)
+            self._log_timing(
+                'search.coarse.stationary_confirm', started,
+                'category={} accepted={}'.format(category, confirmed))
+            if confirmed:
+                category, pose = confirmed_detection
+                if category == self.target_category:
+                    rospy.loginfo(
+                        '%s target category=%s confirmed at initial coarse '
+                        'view; entering fixed-area search', label, category)
+                    return pose
+                if not self._is_seen_non_target(category, pose):
+                    self._record_non_target(category, pose)
+                rospy.loginfo(
+                    '%s static view confirmed non-target=%s; '
+                    'continuing coarse rotation', label, category)
+                since_received = self.vision_pose_received
+            else:
+                since_received = self.vision_pose_received
 
         self._set_state('ROTATE_SEARCH')
         rospy.logwarn(
@@ -1204,31 +1499,51 @@ class PickPlaceExecutor:
                 detection = self._current_known_detection(since_received)
                 if detection is not None:
                     category, pose = detection
-                    if category == self.target_category:
-                        self._stop_base()
-                        self._log_timing(
-                            'search.coarse.rotation', rotation_started,
-                            'target category={} angle={:.2f}'.format(
-                                category, accumulated_yaw))
-                        self._set_state('CONFIRM_CUBE')
-                        self.detected_category_pub.publish(String(data=category))
+                    if self._is_seen_non_target(category, pose):
                         rospy.loginfo(
-                            'confirmed target cube: category=%s '
-                            'confidence=%.3f after %.2f rad',
-                            category, self.vision_pose_confidence,
-                            accumulated_yaw)
-                        return pose
-                    if not self._is_seen_non_target(category, pose):
-                        self._stop_base()
-                        confirm_started = time.monotonic()
-                        self._set_state('CONFIRM_CUBE')
-                        self._record_non_target(category, pose)
-                        time.sleep(self.search_settle_time)
-                        self._log_timing(
-                            'search.coarse.non_target_confirm',
-                            confirm_started, 'category=' + category)
+                            '%s skipping previously confirmed non-target=%s '
+                            'during coarse rotation', label, category)
+                        since_received = self.vision_pose_received
                         _, _, previous_yaw = self._base_pose_odom()
                         self._set_state('ROTATE_SEARCH')
+                        continue
+                    # Stop for every known cube, not only the requested one.
+                    # A moving view can produce a transient category/pose pair;
+                    # stationary confirmation must decide before searching on.
+                    confirm_started = time.monotonic()
+                    confirmed, confirmed_detection = \
+                        self._confirm_search_target(
+                            detection, label, center_view=True)
+                    self._log_timing(
+                        'search.coarse.stationary_confirm', confirm_started,
+                        'category={} accepted={}'.format(
+                            category, confirmed))
+                    if not confirmed:
+                        since_received = self.vision_pose_received
+                        _, _, previous_yaw = self._base_pose_odom()
+                        self._set_state('ROTATE_SEARCH')
+                        continue
+
+                    category, pose = confirmed_detection
+                    if category == self.target_category:
+                        self._log_timing(
+                            'search.coarse.rotation', rotation_started,
+                            'target category={} confirmed at angle={:.2f}; '
+                            'entering fixed-area search'.format(
+                                category, accumulated_yaw))
+                        return pose
+
+                    if not self._is_seen_non_target(category, pose):
+                        self._record_non_target(category, pose)
+                    self._log_timing(
+                        'search.coarse.rotation', rotation_started,
+                        'confirmed non-target={} angle={:.2f}; '
+                        'continuing coarse rotation'.format(
+                            category, accumulated_yaw))
+                    since_received = self.vision_pose_received
+                    _, _, previous_yaw = self._base_pose_odom()
+                    self._set_state('ROTATE_SEARCH')
+                    continue
 
                 self.cmd_vel_pub.publish(command)
                 time.sleep(period)
@@ -1270,6 +1585,13 @@ class PickPlaceExecutor:
             moved = self._direct_search_move(
                 target_x, target_y,
                 'failure-local move {}'.format(index))
+            if moved is False:
+                rospy.logwarn(
+                    'failure-local direct move %d failed; retrying with '
+                    'move_base while arm is raised', index)
+                moved = self._navigate(
+                    target_x, target_y, search_yaw,
+                    'failure-local move_base {}'.format(index), retries=0)
             if not moved:
                 continue
             waypoint = {'x': target_x, 'y': target_y, 'yaw': search_yaw}
@@ -1281,27 +1603,36 @@ class PickPlaceExecutor:
         self._move_arm('navigation')
         return None
 
-    def _search_area_waypoint(self, waypoint, index,
-                              _standoff_attempt=False):
+    def _search_area_waypoint(
+            self, waypoint, index, _standoff_attempt=False,
+            _skip_move=False, _keep_observe=False,
+            _stop_on_confirmed_non_target=True, _reuse_observe=False,
+            _fast_target_candidate=False, _allow_standoff=True):
         area = str(waypoint['area'])
         label = 'area search {} ({})'.format(index, area)
         target_x = float(waypoint['x'])
         target_y = float(waypoint['y'])
-        target_yaw = float(waypoint['yaw'])
+        target_yaw = self._area_observation_yaw(area, waypoint)
         started = time.monotonic()
-        moved = self._direct_search_move(
-            target_x, target_y, label)
         move_mode = 'direct'
-        if moved is None:
-            move_mode = 'move_base'
-            moved = self._navigate(
-                target_x, target_y, target_yaw, label, retries=0)
-        if not moved:
+        if _skip_move:
+            moved = True
             self._log_timing(
                 'search.{}.move'.format(area), started,
-                'mode={} failed'.format(move_mode))
-            rospy.logwarn('%s move failed; trying next area', label)
-            return None
+                'mode=existing search pose')
+        else:
+            moved = self._direct_search_move(
+                target_x, target_y, label, hold_yaw=target_yaw)
+            if moved is None:
+                move_mode = 'move_base'
+                moved = self._navigate(
+                    target_x, target_y, target_yaw, label, retries=0)
+            if not moved:
+                self._log_timing(
+                    'search.{}.move'.format(area), started,
+                    'mode={} failed'.format(move_mode))
+                rospy.logwarn('%s move failed; trying next area', label)
+                return None
         self._log_timing(
             'search.{}.move'.format(area), started, 'mode=' + move_mode)
 
@@ -1310,56 +1641,64 @@ class PickPlaceExecutor:
         time.sleep(self.search_settle_time)
         self._log_timing('search.{}.settle'.format(area), started)
         started = time.monotonic()
-        joint1_offset = 0.0
+        actual_yaw = target_yaw
         if move_mode == 'direct':
             _, _, actual_yaw = self._base_pose_map()
-            nominal_joint1 = self._read_arm_pose('observe')[0][0]
+            nominal_joint1 = self._read_arm_pose('area_observe')[0][0]
             yaw_delta = self._wrap_angle(target_yaw - actual_yaw)
-            if abs(yaw_delta) > self.area_search_reorient_yaw_threshold:
-                # Large arm_joint1 compensation is especially fragile for
-                # area_c (it can approach the joint limit and hide a near
-                # cube). Reorient the base while the arm is safely raised;
-                # ordinary area transitions retain the faster direct mode.
+            base_joint1_offset = self._area_view_joint1_offset(
+                nominal_joint1, target_yaw, actual_yaw)
+            if base_joint1_offset is not None:
+                if abs(yaw_delta) > self.area_search_reorient_yaw_threshold:
+                    rospy.loginfo(
+                        '%s base yaw differs by %.3f; using the legal '
+                        'absolute arm_joint1 target', label, yaw_delta)
                 rospy.loginfo(
-                    '%s yaw delta %.3f exceeds %.3f; reorienting base with '
-                    'move_base before observe', label, yaw_delta,
-                    self.area_search_reorient_yaw_threshold)
+                    '%s base aligned; observe joint1 offset=%.3f rad '
+                    '(target=%.3f)', label, base_joint1_offset,
+                    nominal_joint1 + base_joint1_offset)
+            else:
+                # A direct known-area transition should normally already face
+                # the area. Reorient only when an optional fast path or a
+                # controller deviation leaves no legal arm compensation.
+                rospy.logwarn(
+                    '%s no legal joint1 compensation for yaw delta %.3f; '
+                    'reorienting base with move_base', label, yaw_delta)
                 self._move_arm('navigation')
                 reoriented = self._navigate(
                     target_x, target_y, target_yaw,
                     label + ' yaw reorientation', retries=0)
-                if reoriented:
-                    move_mode = 'move_base'
-                    rospy.loginfo(
-                        '%s base reoriented; using nominal observe joint1',
-                        label)
-                else:
-                    rospy.logwarn(
-                        '%s base reorientation failed; retaining bounded '
-                        'joint1 compensation', label)
-            if move_mode == 'move_base':
-                joint1_offset = 0.0
-            else:
-                yaw_delta = self._wrap_angle(target_yaw - actual_yaw)
-                candidates = [yaw_delta + 2.0 * math.pi * turns
-                              for turns in (-1, 0, 1)]
-                valid_offsets = [offset for offset in candidates
-                                 if -3.14 <= nominal_joint1 + offset <= 3.14]
-                if not valid_offsets:
+                if not reoriented:
                     raise RuntimeError(
-                        '{} has no observe joint1 compensation within limits'.format(
-                            label))
-                joint1_offset = min(valid_offsets, key=abs)
+                        '{} has no usable yaw compensation'.format(label))
+                move_mode = 'move_base'
+                actual_yaw = target_yaw
                 rospy.loginfo(
-                    '%s keeping base yaw; observe joint1 compensation=%.3f rad',
-                    label, joint1_offset)
+                    '%s base reoriented only as arm-limit fallback', label)
         detection = None
         non_target_detection = None
         non_target_conflict = False
-        view_offsets = [0.0] + self.area_search_pan_offsets
-        for view_index, pan_offset in enumerate(view_offsets):
-            view_joint1_offset = joint1_offset + pan_offset
-            nominal_joint1 = self._read_arm_pose('observe')[0][0]
+        view_specs = []
+        for stage_index, stage in enumerate(self.area_search_view_stages):
+            pose_name = str(stage['pose'])
+            view_offsets = [0.0] + [
+                float(value) for value in stage.get('pan_offsets', [])]
+            nominal_joint1 = self._read_arm_pose(pose_name)[0][0]
+            stage_joint1_offset = self._area_view_joint1_offset(
+                nominal_joint1, target_yaw, actual_yaw)
+            if stage_joint1_offset is None:
+                raise RuntimeError(
+                    '{} has no {} joint1 compensation within limits'.format(
+                        label, pose_name))
+            for view_index, pan_offset in enumerate(view_offsets):
+                view_specs.append((
+                    stage_index, pose_name, view_index, pan_offset,
+                    len(view_offsets), nominal_joint1,
+                    stage_joint1_offset + pan_offset))
+
+        for (stage_index, pose_name, view_index, pan_offset,
+             stage_view_count, nominal_joint1,
+             view_joint1_offset) in view_specs:
             if not -3.14 <= nominal_joint1 + view_joint1_offset <= 3.14:
                 rospy.logwarn(
                     '%s skipping pan offset %.3f outside joint1 limits',
@@ -1367,10 +1706,17 @@ class PickPlaceExecutor:
                 continue
 
             started = time.monotonic()
-            self._move_arm('observe', joint1_offset=view_joint1_offset)
+            reuse_view = (
+                _reuse_observe and stage_index == 0 and view_index == 0
+                and pose_name == str(self.area_search_view_stages[0]['pose'])
+                and abs(view_joint1_offset) <= self.joint_tolerance)
+            if not reuse_view:
+                self._move_arm(
+                    pose_name, joint1_offset=view_joint1_offset)
             self._log_timing(
                 'search.{}.observe_arm'.format(area), started,
-                'view={} pan_offset={:.3f}'.format(view_index, pan_offset))
+                'stage={} pose={} view={} pan_offset={:.3f} reused={}'.format(
+                    stage_index, pose_name, view_index, pan_offset, reuse_view))
             time.sleep(self.area_search_view_settle_time)
             barrier_seq = self.vision_pose_seq
             try:
@@ -1380,7 +1726,8 @@ class PickPlaceExecutor:
 
             self._set_state('OBSERVE_' + area.upper())
             started = time.monotonic()
-            timeout = (self.area_search_timeout if view_index == 0
+            timeout = (self.area_search_timeout
+                       if stage_index == 0 and view_index == 0
                        else self.area_search_pan_timeout)
             detection = self._fresh_search_detection(barrier_seq, timeout)
             self._log_timing(
@@ -1388,12 +1735,37 @@ class PickPlaceExecutor:
                 'view={} pan_offset={:.3f} detected={}'.format(
                     view_index, pan_offset, detection is not None))
             if detection is not None:
-                confirmed, confirmed_detection = \
-                    self._confirm_search_target(detection, label)
-                if not confirmed:
+                detected_area = self._search_area_name(detection[1])
+                if detected_area != area:
+                    rospy.logwarn(
+                        '%s ignored %s detection outside current %s area',
+                        label, detection[0], area)
                     detection = None
+                    continue
+                if (_fast_target_candidate
+                        and detection[0] == self.target_category):
+                    rospy.loginfo(
+                        '%s fast target candidate accepted for fixed-view '
+                        'revalidation', label)
                 else:
-                    detection = confirmed_detection
+                    confirmed, confirmed_detection = \
+                        self._confirm_search_target(
+                            detection, label, expected_area=area)
+                    if not confirmed:
+                        detection = None
+                    else:
+                        detection = confirmed_detection
+                if (detection is not None
+                        and detection[0] != self.target_category
+                        and _stop_on_confirmed_non_target):
+                    if not self._is_seen_non_target(detection[0], detection[1]):
+                        self._record_non_target(detection[0], detection[1])
+                    rospy.loginfo(
+                        '%s confirmed non-target %s at center view; '
+                        'skipping remaining pan views', label, detection[0])
+                    if not _keep_observe:
+                        self._move_arm('navigation')
+                    return None
                 if (detection is not None
                         and detection[0] == self.target_category):
                     seen_category = self._seen_category_at_pose(detection[1])
@@ -1427,7 +1799,7 @@ class PickPlaceExecutor:
                         'stationary views for target %s',
                         label, view_index, detection[0], self.target_category)
                     detection = None
-            if view_index + 1 < len(view_offsets):
+            if view_index + 1 < stage_view_count:
                 rospy.loginfo(
                     '%s center/corner view missed; trying stationary pan '
                     'offset %.3f rad',
@@ -1450,7 +1822,7 @@ class PickPlaceExecutor:
             # nominal waypoint.  Keep the normal center/corner search fast;
             # only after all stationary views fail, move a bounded distance
             # away from the area's center and repeat the same views once.
-            if not _standoff_attempt:
+            if _allow_standoff and not _standoff_attempt:
                 bounds = self.search_areas.get(area, {})
                 try:
                     area_center_x = 0.5 * (
@@ -1501,25 +1873,108 @@ class PickPlaceExecutor:
         if not self._is_seen_non_target(category, pose):
             self._record_non_target(category, pose)
         rospy.loginfo('%s contains non-target %s; trying next area', area, category)
+        if not _keep_observe:
+            self._move_arm('navigation')
+        return None
+
+    def _fast_area_search(self):
+        """Search all configured regions from one coarse base pose first.
+
+        The normal fixed-area and full-rotation searches remain below this
+        fast path. A center view that independently confirms a non-target is
+        sufficient to skip that area's pan views because spawn_cubes places
+        exactly one cube in each configured source area.
+        """
+        self._set_state('FAST_AREA_SEARCH')
+        coarse_x = float(self.coarse_search_pose['x'])
+        coarse_y = float(self.coarse_search_pose['y'])
+        coarse_yaw = float(self.coarse_search_pose['yaw'])
+        started = time.monotonic()
+        if not self._navigate(
+                coarse_x, coarse_y, coarse_yaw,
+                'fast area search coarse pose', retries=0):
+            rospy.logwarn('fast area search coarse navigation failed')
+            return None
+        self._stop_base()
+        time.sleep(self.search_settle_time)
+        self._move_arm(str(self.area_search_view_stages[0]['pose']))
+
+        for index, waypoint in enumerate(self.area_search_waypoints):
+            pose = self._search_area_waypoint(
+                waypoint, index, _skip_move=True, _keep_observe=True,
+                _stop_on_confirmed_non_target=(
+                    self.fast_area_stop_on_non_target),
+                _reuse_observe=(index == 0),
+                _fast_target_candidate=True, _allow_standoff=False)
+            if pose is not None:
+                rospy.loginfo(
+                    'fast area candidate found in %s; revalidating from '
+                    'standard fixed observation pose', waypoint['area'])
+                self._move_arm('navigation')
+                validated_pose = self._search_area_waypoint(
+                    waypoint, index)
+                if validated_pose is not None:
+                    self._log_timing(
+                        'search.fast_area.total', started,
+                        'source={}'.format(waypoint['area']))
+                    return validated_pose
+                rospy.logwarn(
+                    'fast area candidate in %s failed fixed-view '
+                    'revalidation; continuing full search', waypoint['area'])
         self._move_arm('navigation')
+        self._log_timing('search.fast_area.total', started, 'missed all areas')
         return None
 
     def _search(self):
         self._set_state('SEARCH_SOURCE')
         started = time.monotonic()
+        if self.fast_area_search:
+            pose = self._fast_area_search()
+            if pose is not None:
+                self._log_timing('search.total', started, 'source=fast_area')
+                return pose
         pose = self._rotate_search_at_pose(self.coarse_search_pose)
         if pose is not None:
-            self._log_timing('search.total', started, 'source=coarse')
+            area = self._search_area_name(pose)
+            if area is not None:
+                waypoint_index, waypoint = next(
+                    ((index, item) for index, item in enumerate(
+                        self.area_search_waypoints)
+                     if str(item['area']) == area), (None, None))
+                if waypoint is not None:
+                    rospy.loginfo(
+                        'coarse target confirmed in %s; entering fixed-area '
+                        'multi-view search', area)
+                    refined = self._search_area_waypoint(
+                        waypoint, waypoint_index, _allow_standoff=False)
+                    if refined is not None:
+                        self._log_timing(
+                            'search.total', started,
+                            'source=coarse-confirmed-area={}'.format(area))
+                        return refined
+                    rospy.logwarn(
+                        'coarse-confirmed target area %s fixed search missed; '
+                        'using the confirmed coarse pose', area)
+            self._log_timing('search.total', started, 'source=coarse-confirmed')
             return pose
         for search_pass in range(self.area_search_passes):
-            if search_pass:
+            allow_standoff = search_pass > 0
+            if not search_pass:
+                rospy.loginfo(
+                    'coarse search missed; visiting area_a -> area_b -> '
+                    'area_c with %d stationary arm views per area before '
+                    'any standoff retry',
+                    sum(1 + len(stage.get('pan_offsets', []))
+                        for stage in self.area_search_view_stages))
+            else:
                 self._set_state('RETRY_AREA_SEARCH')
                 rospy.logwarn(
-                    'target missed in all fixed areas; starting stationary '
-                    'area search pass %d/%d',
+                    'target missed in nominal A/B/C sweep; starting '
+                    'standoff-enabled area search pass %d/%d',
                     search_pass + 1, self.area_search_passes)
             for index, waypoint in enumerate(self.area_search_waypoints):
-                pose = self._search_area_waypoint(waypoint, index)
+                pose = self._search_area_waypoint(
+                    waypoint, index, _allow_standoff=allow_standoff)
                 if pose is not None:
                     self._log_timing(
                         'search.total', started,
@@ -1527,7 +1982,7 @@ class PickPlaceExecutor:
                             waypoint['area'], search_pass + 1))
                     return pose
         raise RuntimeError(
-            'target was not detected by coarse or repeated fixed area searches')
+            'target was not detected by coarse or repeated multi-view area searches')
 
     @staticmethod
     def _clamp(value, limit):
@@ -1637,22 +2092,15 @@ class PickPlaceExecutor:
                 iteration, target.x, target.y, goal_x, goal_y,
                 error_xy, grasp_yaw)
             if error_xy <= self.fine_align_distance:
-                # First close the translational gap while preserving the
-                # observation heading, so the cube remains in camera view.
-                self._fine_align_to_grasp(target, rotate=False)
-                refreshed_pose = self._reset_vision_and_observe()
-                if refreshed_pose is None:
-                    rospy.logwarn(
-                        'fresh vision pose unavailable after translational '
-                        'fine alignment; using last stable map pose')
-                    refreshed_target = target
-                else:
-                    refreshed_target = self._point_in_frame(
-                        refreshed_pose, 'map').point
-                # The final yaw correction happens with the arm raised; no
-                # further camera observation is needed after this rotation.
+                # Finish position and yaw together.  A second observation here
+                # would load the nominal observe pose (joint1=+90 degrees)
+                # after the base had already moved, causing a visible arm
+                # snap and invalidating the fixed-area camera heading.
                 self._move_arm('navigation')
-                self._fine_align_to_grasp(refreshed_target, rotate=True)
+                rospy.loginfo(
+                    'final grasp alignment: simultaneous XY/yaw correction '
+                    'from stable visual target')
+                self._fine_align_to_grasp(target, rotate=True)
                 return
             if iteration >= self.max_align_iterations:
                 break
@@ -1666,17 +2114,13 @@ class PickPlaceExecutor:
                     'visual alignment {}'.format(iteration), retries=0):
                 raise RuntimeError('visual alignment navigation failed')
             self._stop_base()
-            refreshed_pose = self._reset_vision_and_observe()
-            if refreshed_pose is None:
-                # The lowered camera can lose the cube during a coarse move.
-                # The map-frame pose remains valid for this short, bounded
-                # correction; a fresh observation is still mandatory after
-                # the final fine alignment below.
-                rospy.logwarn(
-                    'fresh vision pose unavailable after coarse alignment; '
-                    'continuing with last stable map pose')
-            else:
-                target_pose = refreshed_pose
+            # Keep the arm in its laser-safe navigation posture during this
+            # bounded correction.  Reloading nominal observe here would reset
+            # arm_joint1 to +90 degrees after every base move; the stable map
+            # target is sufficient for the remaining <= one metre correction.
+            rospy.loginfo(
+                'visual alignment %d reached intermediate pose; retaining '
+                'stable target without observe-arm reload', iteration)
         raise RuntimeError('visual alignment did not converge')
 
     def _align_to_grasp(self, first_pose, require_source_area=True):
@@ -1687,8 +2131,11 @@ class PickPlaceExecutor:
         self._set_state('PREPARE_GRASP')
         prepare_started = time.monotonic()
         started = time.monotonic()
+        self._move_arm('grasp_approach')
+        self._log_timing('grasp.prepare.approach_arm', started)
+        started = time.monotonic()
         self._move_arm('grasp')
-        self._log_timing('grasp.prepare.arm', started)
+        self._log_timing('grasp.prepare.descend_arm', started)
         started = time.monotonic()
         deadline = time.monotonic() + 3.0
         while not rospy.is_shutdown() and time.monotonic() < deadline:
@@ -1800,6 +2247,28 @@ class PickPlaceExecutor:
         if self.grasp_state != 'GRASPING' or self.attached_model != expected:
             raise RuntimeError('attachment lost during transport')
 
+    def _wait_attached_gripper_settle(self):
+        deadline = time.monotonic() + self.settle_timeout
+        previous = None
+        settled = 0
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
+            self._check_attachment()
+            position = self.joint_values.get('r_joint')
+            if position is None:
+                time.sleep(0.05)
+                continue
+            if (previous is not None
+                    and abs(position - previous)
+                    <= self.settle_position_delta):
+                settled += 1
+                if settled >= self.settle_samples:
+                    return
+            else:
+                settled = 0
+            previous = position
+            time.sleep(0.05)
+        raise RuntimeError('attached gripper did not settle before transport')
+
     def _refresh_costmaps_after_pickup(self):
         """Remove the picked cube's stale laser obstacle before transport."""
         global_updates = self._global_costmap_updates
@@ -1848,6 +2317,7 @@ class PickPlaceExecutor:
         started = time.monotonic()
         self._command_gripper(
             self.gripper_close, 'hold', attachment_satisfies=True)
+        self._wait_attached_gripper_settle()
         self._log_timing('grasp.hold', started)
         self._log_timing('grasp.total', grasp_started)
 
@@ -1917,7 +2387,8 @@ class PickPlaceExecutor:
         for index, target_yaw in enumerate((0.0, math.pi)):
             if not self._navigate(
                     target_x, target_y, target_yaw,
-                    'parking approach {}'.format(index), retries=0):
+                    'parking approach {}'.format(index),
+                    retries=self.nav_retries):
                 continue
             try:
                 self._fine_align_to_parking(
@@ -1937,7 +2408,7 @@ class PickPlaceExecutor:
         self._set_state('INIT_VALIDATE')
         if not self.arm_poses_verified:
             raise RuntimeError(
-                'arm_poses_verified is false; confirm the three arm poses are safe')
+                'arm_poses_verified is false; confirm configured arm poses are safe')
         rospy.loginfo('waiting for move_base action server')
         if not self._wait_for_action_server(self.nav_client, 'move_base'):
             raise RuntimeError('move_base action server unavailable')
@@ -2016,6 +2487,7 @@ def main():
             # Once a target has been located, keep recovering and searching
             # around the failure pose until that same category is seen again.
             # Do not clear target_category or return to WAITING_FOR_CATEGORY.
+            recovery_failures = 0
             while not rospy.is_shutdown() and retry_detection is None:
                 try:
                     recovered = executor._recover_after_failure()
@@ -2024,8 +2496,20 @@ def main():
                     rospy.logerr(
                         'pick-place failure recovery failed: %s', recovery_exc)
                 if not recovered:
+                    recovery_failures += 1
+                    if recovery_failures >= MAX_FAILURE_RECOVERY_ATTEMPTS:
+                        reason = (
+                            'failure recovery did not complete after {} '
+                            'attempts'.format(recovery_failures))
+                        executor._stop_base()
+                        executor._set_state('FAILED')
+                        executor.result_pub.publish(
+                            String(data='FAILED:' + reason))
+                        rospy.logerr('%s; stopping task safely', reason)
+                        return
                     time.sleep(executor.failure_search_retry_delay)
                     continue
+                recovery_failures = 0
                 if not executor.target_was_located:
                     # No target pose existed (for example, all source views
                     # missed), so retry the normal A/B/C search.
