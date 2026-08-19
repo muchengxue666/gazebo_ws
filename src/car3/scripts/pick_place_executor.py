@@ -1750,7 +1750,8 @@ class PickPlaceExecutor:
                 else:
                     confirmed, confirmed_detection = \
                         self._confirm_search_target(
-                            detection, label, expected_area=area)
+                            detection, label, expected_area=area,
+                            center_view=True)
                     if not confirmed:
                         detection = None
                     else:
