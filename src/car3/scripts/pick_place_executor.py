@@ -243,6 +243,8 @@ class PickPlaceExecutor:
         self.transport_tcp_in_base = None
         self.place_tcp_in_base = None
         self.target_was_located = False
+        self.grasp_completed = False
+        self.startup_prepared = False
 
         self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(20.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
@@ -476,7 +478,7 @@ class PickPlaceExecutor:
                 raise rospy.ROSInitException(name + ' must be positive')
         required_arm_poses = [
             'navigation', 'observe', 'area_observe', 'grasp_approach',
-            'grasp', 'transport', 'place']
+            'grasp', 'grasp_lift', 'transport', 'place']
         required_arm_poses.extend(
             str(stage['pose']) for stage in self.area_search_view_stages)
         for name in dict.fromkeys(required_arm_poses):
@@ -601,6 +603,7 @@ class PickPlaceExecutor:
             ' ' + detail if detail else '')
 
     def wait_for_target_category(self):
+        self._prepare_task_start()
         self._set_state('WAITING_FOR_CATEGORY')
         rospy.loginfo(
             'waiting for std_msgs/String on %s: %s',
@@ -609,6 +612,39 @@ class PickPlaceExecutor:
             time.sleep(0.05)
         if self.target_category is None:
             raise RuntimeError('category wait interrupted by shutdown')
+
+    def _prepare_task_start(self):
+        if self.startup_prepared:
+            return
+        started = time.monotonic()
+        self._set_state('PREPARE_WHILE_WAITING')
+        if not self.arm_poses_verified:
+            raise RuntimeError(
+                'arm_poses_verified is false; confirm configured arm poses are safe')
+        if not self._wait_for_action_server(self.nav_client, 'move_base'):
+            raise RuntimeError('move_base action server unavailable')
+        if not self._wait_for_action_server(
+                self.arm_client, 'arm trajectory'):
+            raise RuntimeError('arm trajectory action server unavailable')
+        if not self._wait_joint_state(8.0):
+            raise RuntimeError('joint state unavailable')
+
+        self._command_gripper(self.gripper_open, 'open')
+        if self.grasp_state != 'IDLE' or self.attached_model:
+            deadline = rospy.Time.now() + rospy.Duration(2.0)
+            while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+                if self.grasp_state == 'IDLE' and not self.attached_model:
+                    break
+                rospy.sleep(0.05)
+        if self.grasp_state != 'IDLE' or self.attached_model:
+            raise RuntimeError('grasp backend is not idle')
+
+        # Only prepare actuators and localization here. The base remains at
+        # its spawn pose until a valid category starts the search.
+        self._move_arm('navigation')
+        self._wait_for_navigation_ready()
+        self.startup_prepared = True
+        self._log_timing('startup.prepare_while_waiting', started)
 
     def _stop_base(self):
         self.cmd_vel_pub.publish(Twist())
@@ -2320,6 +2356,14 @@ class PickPlaceExecutor:
             self.gripper_close, 'hold', attachment_satisfies=True)
         self._wait_attached_gripper_settle()
         self._log_timing('grasp.hold', started)
+        # Reverse the verified grasp-approach trajectory before transport.
+        # This avoids introducing a new wrist-folding motion immediately after
+        # the cube has been attached.
+        self._set_state('LIFT_GRASP')
+        started = time.monotonic()
+        self._move_arm('grasp_lift')
+        self._check_attachment()
+        self._log_timing('grasp.lift', started)
         self._log_timing('grasp.total', grasp_started)
 
     def _parking_footprint_inside(self, x, y, yaw, area):
@@ -2407,34 +2451,10 @@ class PickPlaceExecutor:
 
     def run(self, initial_detection=None, failure_local_detection=False):
         self._set_state('INIT_VALIDATE')
-        if not self.arm_poses_verified:
-            raise RuntimeError(
-                'arm_poses_verified is false; confirm configured arm poses are safe')
-        rospy.loginfo('waiting for move_base action server')
-        if not self._wait_for_action_server(self.nav_client, 'move_base'):
-            raise RuntimeError('move_base action server unavailable')
-        rospy.loginfo('move_base action server is ready')
-        rospy.loginfo('waiting for arm trajectory action server')
-        if not self._wait_for_action_server(
-                self.arm_client, 'arm trajectory'):
-            raise RuntimeError('arm trajectory action server unavailable')
-        rospy.loginfo('arm trajectory action server is ready')
-        if not self._wait_joint_state(8.0):
-            raise RuntimeError('joint state unavailable')
-        self._set_state('RESET_GRIPPER')
-        self._command_gripper(self.gripper_open, 'open')
-        deadline = rospy.Time.now() + rospy.Duration(2.0)
-        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
-            if self.grasp_state == 'IDLE' and not self.attached_model:
-                break
-            rospy.sleep(0.05)
-        if self.grasp_state != 'IDLE' or self.attached_model:
-            raise RuntimeError('grasp backend is not idle')
-
-        # Always start coarse navigation from the verified laser-safe posture;
-        # a previous task may have left the arm in its place posture.
-        self._move_arm('navigation')
-        self._wait_for_navigation_ready()
+        self._prepare_task_start()
+        # This flag distinguishes a failed alignment/attachment from a later
+        # transport or parking failure in the outer recovery loop.
+        self.grasp_completed = False
         # Search first. Geometry measurement moves through grasp/place poses
         # and must not delay the initial navigation.
         detection = initial_detection
@@ -2448,6 +2468,7 @@ class PickPlaceExecutor:
             self._measure_arm_geometry()
         self._align_prepare_and_grasp(
             detection, require_source_area=not failure_local_detection)
+        self.grasp_completed = True
         self._navigate_to_parking()
         self._set_state('SUCCESS')
         rospy.set_param('/gazebo_success', 1)
@@ -2514,6 +2535,15 @@ def main():
                 if not executor.target_was_located:
                     # No target pose existed (for example, all source views
                     # missed), so retry the normal A/B/C search.
+                    break
+                if not executor.grasp_completed:
+                    # Alignment, close, attachment confirmation, or lift
+                    # failed. The failed pose is no longer trustworthy, so
+                    # restart from the complete coarse search rather than
+                    # repeatedly circling the same failed station.
+                    rospy.logwarn(
+                        'grasp did not complete for %s; restarting coarse '
+                        'search', executor.target_category)
                     break
                 if failure_pose is None:
                     try:

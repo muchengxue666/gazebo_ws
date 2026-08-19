@@ -52,6 +52,12 @@ arm_poses:
   grasp:
     positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.000000]
     duration: 3.0
+  # After attachment, reverse the already verified grasp approach trajectory.
+  # This raises and retracts the gripper through a configuration known not to
+  # self-collide, instead of folding the wrist into the arm after closing.
+  grasp_lift:
+    positions: [0.000000, 1.570820, -0.910000, 2.580000, 0.000000]
+    duration: 3.0
   # Keep the object attached in this raised posture while navigating.
   transport:
     positions: [0.0, 1.6, -2.2, -1.0, 0.0]
@@ -60,7 +66,7 @@ arm_poses:
     positions: [0.000288, 1.570820, 0.126232, 1.570326, 0.000000]
     duration: 3.0
 
-gripper_open: 1.5
+gripper_open: 1.45
 gripper_close: 0.8
 min_confidence: 0.38
 max_pose_age: 0.8

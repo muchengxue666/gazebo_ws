@@ -65,6 +65,33 @@ class PickPlaceSearchTest(unittest.TestCase):
         executor._fresh_target_pose.assert_called_once_with(7, timeout=4.0)
         self.assertEqual(['daily'], executor.detected_category_pub.messages)
 
+    @mock.patch('pick_place_executor.rospy.is_shutdown', return_value=False)
+    def test_task_start_is_prepared_once_before_category(self, _shutdown):
+        executor = PickPlaceExecutor.__new__(PickPlaceExecutor)
+        executor.startup_prepared = False
+        executor.arm_poses_verified = True
+        executor.nav_client = object()
+        executor.arm_client = object()
+        executor.gripper_open = 1.5
+        executor.grasp_state = 'IDLE'
+        executor.attached_model = ''
+        executor._set_state = mock.Mock()
+        executor._wait_for_action_server = mock.Mock(return_value=True)
+        executor._wait_joint_state = mock.Mock(return_value=True)
+        executor._command_gripper = mock.Mock()
+        executor._move_arm = mock.Mock()
+        executor._wait_for_navigation_ready = mock.Mock()
+        executor._log_timing = mock.Mock()
+
+        executor._prepare_task_start()
+        executor._prepare_task_start()
+
+        self.assertTrue(executor.startup_prepared)
+        self.assertEqual(2, executor._wait_for_action_server.call_count)
+        executor._command_gripper.assert_called_once_with(1.5, 'open')
+        executor._move_arm.assert_called_once_with('navigation')
+        executor._wait_for_navigation_ready.assert_called_once_with()
+
     @mock.patch('pick_place_executor.time.sleep')
     def test_stopped_confirmation_rejects_shifted_pose(self, _sleep):
         executor = self._executor(_pose(-1.30, 0.10))
@@ -118,6 +145,48 @@ class PickPlaceSearchTest(unittest.TestCase):
         self.assertEqual(
             [mock.call('grasp_approach'), mock.call('grasp')],
             executor._move_arm.call_args_list)
+
+    def test_attached_cube_is_lifted_before_transport(self):
+        executor = PickPlaceExecutor.__new__(PickPlaceExecutor)
+        executor.ready = True
+        executor.gripper_close = 0.8
+        executor.grasp_state = 'GRASPING'
+        executor.attached_model = 'cube_1'
+        executor.target_category = 'daily'
+        executor.category_to_model = {'daily': 'cube_1'}
+        events = []
+        executor._set_state = lambda state: events.append(('state', state))
+        executor._command_gripper = mock.Mock()
+        executor._wait_attach = lambda: events.append(('attached', None))
+        executor._wait_attached_gripper_settle = mock.Mock()
+        executor._move_arm = lambda name: events.append(('arm', name))
+        executor._check_attachment = lambda: events.append(('checked', None))
+        executor._log_timing = mock.Mock()
+
+        executor._grasp()
+
+        self.assertLess(
+            events.index(('attached', None)),
+            events.index(('arm', 'grasp_lift')))
+        self.assertLess(
+            events.index(('arm', 'grasp_lift')),
+            events.index(('checked', None)))
+
+    def test_lift_reverses_the_verified_grasp_approach(self):
+        with open(os.path.join(
+                PACKAGE_ROOT, 'config', 'nav_pick_place_task.yaml'),
+                encoding='utf-8') as config_file:
+            config = yaml.safe_load(config_file)
+        approach = config['arm_poses']['grasp_approach']
+        lift = config['arm_poses']['grasp_lift']
+
+        # Grasp approach was executed collision-free before the gripper closed;
+        # returning through its exact reverse avoids introducing an untested
+        # self-folding lift trajectory after an object is attached.
+        self.assertNotEqual(
+            config['arm_poses']['grasp']['positions'], lift['positions'])
+        self.assertEqual(approach['positions'], lift['positions'])
+        self.assertEqual(approach['duration'], lift['duration'])
 
     def test_search_visits_all_nominal_areas_before_standoff_retry(self):
         executor = PickPlaceExecutor.__new__(PickPlaceExecutor)

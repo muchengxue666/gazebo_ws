@@ -8,9 +8,20 @@ import numpy as np
 
 CATEGORIES = ('food', 'daily', 'electronics')
 TEMPLATE_FILES = {
-    'food': 'Food.png',
-    'daily': 'Daily_Necessities.png',
-    'electronics': 'Electronics.png',
+    # A category may have several views.  The classifier keeps the strongest
+    # evidence among them, so adding a view improves recall without weakening
+    # the category margin against the other classes.
+    'food': ('Food.png',),
+    'daily': (
+        'Daily_Necessities.png',
+        'Daily_Necessities_far.png',
+        'Daily_Necessities_tilt.png',
+    ),
+    'electronics': (
+        'Electronics.png',
+        'Electronics_far.png',
+        'Electronics_tilt.png',
+    ),
 }
 
 
@@ -42,6 +53,11 @@ class CubeVisionCore:
         self.min_template_coverage = float(
             params.get('min_template_coverage', 0.008))
         self.min_roi_coverage = float(params.get('min_roi_coverage', 0.004))
+        self.extra_template_min_roi_coverage = float(
+            params.get('extra_template_min_roi_coverage',
+                       max(self.min_roi_coverage * 2.0, 0.008)))
+        self.extra_template_min_template_coverage = float(
+            params.get('extra_template_min_template_coverage', 0.03))
         self.min_category_margin = float(params.get('min_category_margin', 0.45))
         self.template_category_fraction = float(
             params.get('template_category_fraction', 0.55))
@@ -54,23 +70,41 @@ class CubeVisionCore:
 
     def _load_templates(self, template_dir):
         templates = {}
-        for category, filename in TEMPLATE_FILES.items():
-            path = os.path.join(template_dir, filename)
-            image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if image is None:
-                raise RuntimeError('Cannot load cube template: {}'.format(path))
-            category_height = max(
-                1, int(round(image.shape[0] * self.template_category_fraction)))
-            image = image[:category_height]
-            prepared = self._prepare_feature_image(image)
-            keypoints, descriptors = self.detector.detectAndCompute(prepared, None)
-            if descriptors is None or len(keypoints) < self.min_feature_matches:
-                raise RuntimeError('Too few SIFT features in template: {}'.format(path))
-            templates[category] = {
-                'image': prepared,
-                'keypoints': keypoints,
-                'descriptors': descriptors,
-            }
+        for category, filenames in TEMPLATE_FILES.items():
+            if isinstance(filenames, str):
+                filenames = (filenames,)
+            category_templates = []
+            for filename in filenames:
+                path = os.path.join(template_dir, filename)
+                image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if image is None:
+                    # Optional extra views must not make an installation with
+                    # only the original templates fail to start.
+                    if filename != filenames[0]:
+                        continue
+                    raise RuntimeError(
+                        'Cannot load cube template: {}'.format(path))
+                category_height = max(
+                    1, int(round(image.shape[0] * self.template_category_fraction)))
+                image = image[:category_height]
+                prepared = self._prepare_feature_image(image)
+                keypoints, descriptors = self.detector.detectAndCompute(
+                    prepared, None)
+                if descriptors is None or len(keypoints) < self.min_feature_matches:
+                    if filename != filenames[0]:
+                        continue
+                    raise RuntimeError(
+                        'Too few SIFT features in template: {}'.format(path))
+                category_templates.append({
+                    'name': filename,
+                    'image': prepared,
+                    'keypoints': keypoints,
+                    'descriptors': descriptors,
+                })
+            if not category_templates:
+                raise RuntimeError(
+                    'No usable cube templates for category: {}'.format(category))
+            templates[category] = category_templates
         return templates
 
     def _prepare_feature_image(self, image):
@@ -189,9 +223,24 @@ class CubeVisionCore:
         details = {}
         homographies = {}
 
-        for category, template in self.templates.items():
-            evidence = self._match_template(
-                template, prepared, roi_keypoints, roi_descriptors)
+        for category, category_templates in self.templates.items():
+            template_results = []
+            for template_index, template in enumerate(category_templates):
+                evidence = self._match_template(
+                    template, prepared, roi_keypoints, roi_descriptors)
+                evidence['template_name'] = template['name']
+                evidence['template_image'] = template['image']
+                # Additional views are useful for oblique/near observations,
+                # but tiny accidental feature clusters are not allowed to
+                # outrank the primary clean template.
+                if (template_index > 0
+                        and (evidence['roi_coverage']
+                             < self.extra_template_min_roi_coverage
+                             or evidence['template_coverage']
+                             < self.extra_template_min_template_coverage)):
+                    evidence['evidence'] = 0.0
+                template_results.append((evidence['evidence'], evidence))
+            _, evidence = max(template_results, key=lambda item: item[0])
             scores[category] = evidence['evidence']
             details[category] = evidence
             homographies[category] = evidence['homography']
@@ -211,7 +260,7 @@ class CubeVisionCore:
         face_quad = None
         homography = homographies[category]
         if valid and homography is not None:
-            template_image = self.templates[category]['image']
+            template_image = best['template_image']
             corners = np.float32([[
                 [0, 0], [template_image.shape[1] - 1, 0],
                 [template_image.shape[1] - 1, template_image.shape[0] - 1],

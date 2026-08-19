@@ -103,6 +103,8 @@ class CubeVision:
             ('min_feature_inliers', 4),
             ('min_template_coverage', 0.008),
             ('min_roi_coverage', 0.004),
+            ('extra_template_min_roi_coverage', 0.008),
+            ('extra_template_min_template_coverage', 0.03),
             ('min_category_margin', 0.45),
             ('template_category_fraction', 0.55),
         )
